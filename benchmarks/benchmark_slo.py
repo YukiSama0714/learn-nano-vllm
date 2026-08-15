@@ -173,7 +173,6 @@ def run_workload(
             finished, _ = llm.step()
             for seq_id, token_ids in finished:
                 outputs[seq_id] = {
-                    "text": llm.tokenizer.decode(token_ids),
                     "token_ids": token_ids,
                     "metrics": llm.take_finished_request_metrics(seq_id),
                 }
@@ -182,8 +181,13 @@ def run_workload(
             sleeper(min(max(delay, 0.0), 0.01))
     if synchronize is not None:
         synchronize()
+    ordered_outputs = []
+    for seq_id in sorted(outputs):
+        output = outputs[seq_id]
+        output["text"] = llm.tokenizer.decode(output["token_ids"])
+        ordered_outputs.append(output)
     elapsed = clock() - started_at
-    return [outputs[seq_id] for seq_id in sorted(outputs)], elapsed
+    return ordered_outputs, elapsed
 
 
 def main():
