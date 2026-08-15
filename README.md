@@ -102,6 +102,7 @@ The 5090 experiment commands and the Chinese source-reading guide are in:
 
 * [`docs/rtx5090-experiments.md`](docs/rtx5090-experiments.md)
 * [`docs/learning-guide-zh.md`](docs/learning-guide-zh.md)
+* [`docs/slo-v2-results-zh.md`](docs/slo-v2-results-zh.md)
 
 **Upstream Test Configuration:**
 - Hardware: RTX 4070 Laptop (8GB)
