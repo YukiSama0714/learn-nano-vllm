@@ -32,6 +32,7 @@ def main():
         "Arrival",
         "Req/s",
         "Chunk",
+        "TTFT/TPOT SLO ms",
         "TTFT P95 ms",
         "TPOT P95 ms",
         "ITL P95 ms",
@@ -57,6 +58,10 @@ def main():
             config.get("arrival_pattern", "bulk"),
             format_number(config.get("request_rate")),
             str(config["prefill_chunk_size"]),
+            (
+                f"{config.get('ttft_slo_ms', '-')}/"
+                f"{config.get('tpot_slo_ms', '-')}"
+            ),
             format_number(summary_percentile(summary, "ttft_ms", "p95")),
             format_number(summary_percentile(summary, "tpot_ms", "p95")),
             format_number(
