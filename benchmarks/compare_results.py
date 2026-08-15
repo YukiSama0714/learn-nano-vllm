@@ -35,9 +35,12 @@ def main():
         "TTFT P95 ms",
         "TPOT P95 ms",
         "ITL P95 ms",
+        "Max ITL P95 ms",
+        "Queue P95 ms",
+        "Chunks P95",
         "E2E P95 ms",
         "TTFT violations",
-        "ITL violations",
+        "Requests with ITL violation",
         "Output tok/s",
         "Cache hit",
         "Peak GiB",
@@ -62,6 +65,17 @@ def main():
                     "inter_token_gap_p95_ms",
                     "p95",
                 )
+            ),
+            format_number(
+                summary_percentile(
+                    summary,
+                    "max_inter_token_gap_ms",
+                    "p95",
+                )
+            ),
+            format_number(summary_percentile(summary, "queue_ms", "p95")),
+            format_number(
+                summary_percentile(summary, "prefill_chunks", "p95")
             ),
             format_number(summary_percentile(summary, "e2e_ms", "p95")),
             format_rate(summary.get("ttft_slo_violation_rate")),
