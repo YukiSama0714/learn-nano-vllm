@@ -32,6 +32,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self._finished_request_metrics = {}
         atexit.register(self.exit)
 
     def exit(self):
@@ -40,18 +41,47 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams,
+        arrival_time: float | None = None,
+    ):
+        arrival_time = perf_counter() if arrival_time is None else arrival_time
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
+        seq = Sequence(prompt, sampling_params, arrival_time)
         self.scheduler.add(seq)
+        return seq.seq_id
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        num_tokens = (
+            sum(seq.num_scheduled_tokens for seq in seqs)
+            if is_prefill
+            else -len(seqs)
+        )
+        started_at = perf_counter()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        finished_at = perf_counter()
+        self.scheduler.postprocess(
+            seqs,
+            token_ids,
+            is_prefill,
+            step_duration=finished_at - started_at,
+            step_finished_at=finished_at,
+        )
+        for seq in seqs:
+            if seq.is_finished:
+                self._finished_request_metrics[seq.seq_id] = seq.metrics.to_dict(
+                    seq.num_prompt_tokens,
+                    seq.num_completion_tokens,
+                )
+        outputs = [
+            (seq.seq_id, seq.completion_token_ids)
+            for seq in seqs
+            if seq.is_finished
+        ]
         return outputs, num_tokens
 
     def is_finished(self):
@@ -62,12 +92,20 @@ class LLMEngine:
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
-    ) -> list[str]:
-        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+    ) -> list[dict]:
+        pbar = tqdm(
+            total=len(prompts),
+            desc="Generating",
+            dynamic_ncols=True,
+            disable=not use_tqdm,
+        )
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+        if len(sampling_params) != len(prompts):
+            raise ValueError("prompts and sampling_params must have equal lengths")
+        arrival_time = perf_counter()
         for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
+            self.add_request(prompt, sp, arrival_time)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
@@ -85,6 +123,12 @@ class LLMEngine:
                 outputs[seq_id] = token_ids
                 pbar.update(1)
         pbar.close()
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [
+            {
+                "text": self.tokenizer.decode(token_ids),
+                "token_ids": token_ids,
+                "metrics": self._finished_request_metrics.pop(seq_id),
+            }
+            for seq_id, token_ids in sorted(outputs.items())
+        ]
         return outputs

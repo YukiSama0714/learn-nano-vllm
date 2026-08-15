@@ -15,6 +15,8 @@ A lightweight vLLM implementation built from scratch.
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
 * 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
 * ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+* 📊 **Request observability** - TTFT, TPOT, queue, prefill, decode, cache-hit, and preemption metrics
+* 🎯 **SLO-aware scheduling** - Adaptive chunked prefill that balances new-request TTFT and active-request TPOT
 
 ## Installation
 
@@ -43,11 +45,48 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+Each output also contains request-level metrics:
+
+```python
+outputs[0]["metrics"]
+# {
+#   "ttft_ms": ...,
+#   "tpot_ms": ...,
+#   "e2e_ms": ...,
+#   "queue_ms": ...,
+#   "prefix_cache_hit_rate": ...,
+#   ...
+# }
+```
+
+The original scheduling behavior remains the default. Enable the experimental
+policy explicitly:
+
+```python
+llm = LLM(
+    "/YOUR/MODEL/PATH",
+    scheduling_policy="slo_aware",
+    prefill_chunk_size=1024,
+    ttft_slo_ms=500,
+    max_consecutive_decode_steps=8,
+)
+```
+
 ## Benchmark
 
-See `bench.py` for benchmark.
+See `bench.py` for the original throughput benchmark.
 
-**Test Configuration:**
+For repeatable request-level SLO experiments, see
+[`benchmarks/benchmark_slo.py`](benchmarks/benchmark_slo.py). The benchmark
+supports fixed workloads, repeated runs, shared-prefix workloads, JSON output,
+and direct comparison between `prefill_first` and `slo_aware`.
+
+The 5090 experiment commands and the Chinese source-reading guide are in:
+
+* [`docs/rtx5090-experiments.md`](docs/rtx5090-experiments.md)
+* [`docs/learning-guide-zh.md`](docs/learning-guide-zh.md)
+
+**Upstream Test Configuration:**
 - Hardware: RTX 4070 Laptop (8GB)
 - Model: Qwen3-0.6B
 - Total Requests: 256 sequences

@@ -1,7 +1,9 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+from time import perf_counter
 
+from nanovllm.engine.metrics import RequestMetrics
 from nanovllm.sampling_params import SamplingParams
 
 
@@ -15,7 +17,13 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(
+        self,
+        token_ids: list[int],
+        sampling_params: SamplingParams | None = None,
+        arrival_time: float | None = None,
+    ):
+        sampling_params = sampling_params or SamplingParams()
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -29,6 +37,9 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.metrics = RequestMetrics(
+            perf_counter() if arrival_time is None else arrival_time
+        )
 
     def __len__(self):
         return self.num_tokens
@@ -71,10 +82,24 @@ class Sequence:
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        return (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
+            self.block_table,
+            last_state,
+        )
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
+            self.block_table,
+            last_state,
+        ) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
