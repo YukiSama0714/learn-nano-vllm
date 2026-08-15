@@ -87,6 +87,9 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
 
+    def take_finished_request_metrics(self, seq_id: int) -> dict:
+        return self._finished_request_metrics.pop(seq_id)
+
     def generate(
         self,
         prompts: list[str] | list[list[int]],
@@ -127,7 +130,7 @@ class LLMEngine:
             {
                 "text": self.tokenizer.decode(token_ids),
                 "token_ids": token_ids,
-                "metrics": self._finished_request_metrics.pop(seq_id),
+                "metrics": self.take_finished_request_metrics(seq_id),
             }
             for seq_id, token_ids in sorted(outputs.items())
         ]

@@ -33,7 +33,7 @@ sequence 同批 decode。每组重复 5 次。
   --output /nano-vllm/5090-runs/prefill-first.json
 ```
 
-SLO 策略：
+SLO v1 策略（保留为负实验基线）：
 
 ```bash
 .venv/bin/python benchmarks/benchmark_slo.py \
@@ -50,18 +50,84 @@ SLO 策略：
   --output /nano-vllm/5090-runs/slo-aware.json
 ```
 
+SLO v2 策略：
+
+```bash
+.venv/bin/python benchmarks/benchmark_slo.py \
+  --model /nano-vllm/models/Qwen3-8B \
+  --num-requests 32 \
+  --max-num-seqs 8 \
+  --input-len 1024 \
+  --output-len 128 \
+  --repeats 5 \
+  --scheduling-policy slo_aware_v2 \
+  --prefill-chunk-size 1024 \
+  --ttft-slo-ms 500 \
+  --tpot-slo-ms 50 \
+  --max-consecutive-decode-steps 8 \
+  --output /nano-vllm/5090-runs/slo-aware-v2.json
+```
+
+### 已记录的 0.6B 负实验
+
+RTX 5090、32 个请求同时到达、1024 输入、128 输出、重复 3 次时，v1 相比
+`prefill_first` 得到：
+
+| 指标 | prefill_first | slo_aware v1 |
+|---|---:|---:|
+| TTFT P95 ms | 607.02 | 1098.27 |
+| TPOT P95 ms | 11.70 | 13.22 |
+| E2E mean ms | 1494.47 | 2213.65 |
+| Queue mean ms | 304.75 | 730.31 |
+| Decode P95 ms | 446.05 | 328.09 |
+| Prefill chunks P95 | 1 | 4 |
+| Output tok/s | 2055.78 | 1768.20 |
+
+v1 降低了 decode 执行时间的尾部波动，但固定 256-token 小 chunk 和延迟
+请求准入使用户可见指标全面退化。这个结果是 v2 的设计依据，不能删除或只
+报告优化后的数字。
+
 重点比较：
 
 | 指标 | 希望观察的问题 |
 |---|---|
 | TTFT P50/P95 | 新请求是否更快获得首 token |
 | TPOT P50/P95 | 长 prefill 是否造成输出卡顿 |
+| ITL P95/Max | TPOT 平均值是否掩盖单次长卡顿 |
+| SLO violation rate | 有多少请求真正超过目标 |
 | Output tok/s | 延迟改善牺牲了多少总吞吐 |
 | Queue P95 | waiting queue 是否存在饥饿 |
 | Prefill chunks | chunk 变小带来了多少额外调用 |
 | Peak memory | 策略是否改变 KV cache 压力 |
 
-## 3. Chunk size 消融
+## 3. 在线到达实验
+
+bulk arrival 只代表离线批处理。正式评价 v2 时还要固定请求率，分别运行三种
+策略。先用 0.6B 寻找低、中、高三个负载点，再在 8B 上复现。
+
+示例：Poisson 8 req/s。
+
+```bash
+.venv/bin/python benchmarks/benchmark_slo.py \
+  --model /nano-vllm/models/Qwen3-0.6B \
+  --num-requests 32 \
+  --max-num-seqs 8 \
+  --input-len 1024 \
+  --output-len 128 \
+  --repeats 3 \
+  --arrival-pattern poisson \
+  --request-rate 8 \
+  --scheduling-policy slo_aware_v2 \
+  --prefill-chunk-size 1024 \
+  --ttft-slo-ms 500 \
+  --tpot-slo-ms 50 \
+  --output /nano-vllm/5090-runs/online-v2.json
+```
+
+低负载时三种策略都应接近零排队；高负载时应同时报告吞吐和违反率，不能用
+更低的实际完成请求率换取看似更好的延迟。
+
+## 4. Chunk size 消融
 
 保持其他参数不变，分别设置：
 
@@ -72,7 +138,7 @@ prefill_chunk_size = 256, 512, 1024, 2048
 不要只选择吞吐最高的配置。应根据项目目标选择“满足 TTFT/TPOT 目标时
 吞吐最高”的配置。
 
-## 4. Prefix cache 实验
+## 5. Prefix cache 实验
 
 随机 prompt 对照组使用 `--shared-prefix-len 0`。共享前缀实验使用：
 
@@ -99,7 +165,7 @@ prefill_chunk_size = 256, 512, 1024, 2048
   /nano-vllm/5090-runs/prefix-512.json
 ```
 
-## 5. KV-cache kernel 实验
+## 6. KV-cache kernel 实验
 
 ```bash
 .venv/bin/python benchmarks/kernels/benchmark_store_kvcache.py \
@@ -112,11 +178,11 @@ prefill_chunk_size = 256, 512, 1024, 2048
 `1/8` 近似 decode 场景，`512/4096` 近似 prefill 场景。修改 kernel 后必须
 同时满足：逐元素结果一致、各尺度无明显回退、端到端指标能够解释。
 
-## 6. 最终报告最少包含
+## 7. 最终报告最少包含
 
 1. 固定的软件版本、GPU、模型和 workload。
-2. 原策略与新策略的 P50/P95 TTFT、TPOT、吞吐和显存。
+2. 三种策略的 P50/P95 TTFT、TPOT、ITL、吞吐、违反率和显存。
 3. Chunk size 消融曲线或表格。
 4. Prefix cache 的命中率与收益。
 5. Kernel microbenchmark 与端到端结果的联系。
-6. 一个失败或反直觉实验，以及原因分析。
+6. v1 负实验、根因分析，以及 v2 是否修复对应退化。

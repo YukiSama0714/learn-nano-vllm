@@ -27,12 +27,20 @@ def parse_args():
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument(
         "--scheduling-policy",
-        choices=("prefill_first", "slo_aware"),
+        choices=("prefill_first", "slo_aware", "slo_aware_v2"),
         default="prefill_first",
     )
     parser.add_argument("--prefill-chunk-size", type=int, default=0)
     parser.add_argument("--ttft-slo-ms", type=float, default=500.0)
+    parser.add_argument("--tpot-slo-ms", type=float, default=50.0)
     parser.add_argument("--max-consecutive-decode-steps", type=int, default=8)
+    parser.add_argument("--scheduler-cost-ema-alpha", type=float, default=0.2)
+    parser.add_argument(
+        "--arrival-pattern",
+        choices=("bulk", "constant", "poisson"),
+        default="bulk",
+    )
+    parser.add_argument("--request-rate", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -47,8 +55,19 @@ def parse_args():
             "--prefill-chunk-size must not exceed "
             "--max-num-batched-tokens"
         )
-    if args.ttft_slo_ms < 0 or args.max_consecutive_decode_steps <= 0:
-        parser.error("SLO scheduler parameters must be non-negative")
+    if (
+        args.ttft_slo_ms < 0
+        or args.tpot_slo_ms <= 0
+        or args.max_consecutive_decode_steps <= 0
+    ):
+        parser.error(
+            "TTFT SLO must be non-negative; TPOT SLO and decode steps "
+            "must be positive"
+        )
+    if not 0 < args.scheduler_cost_ema_alpha <= 1:
+        parser.error("--scheduler-cost-ema-alpha must be in (0, 1]")
+    if args.arrival_pattern != "bulk" and args.request_rate <= 0:
+        parser.error("--request-rate must be positive for online arrivals")
     return args
 
 
@@ -74,6 +93,24 @@ def summarize(values):
     }
 
 
+def violation_rate(values, target):
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return round(sum(value > target for value in values) / len(values), 6)
+
+
+def make_arrival_offsets(pattern, request_rate, num_requests, rng):
+    if pattern == "bulk":
+        return [0.0] * num_requests
+    if pattern == "constant":
+        return [index / request_rate for index in range(num_requests)]
+    offsets = [0.0]
+    for _ in range(1, num_requests):
+        offsets.append(offsets[-1] + rng.expovariate(request_rate))
+    return offsets
+
+
 def make_workload(args, vocab_size, repeat):
     rng = random.Random(args.seed + repeat)
     shared_prefix = [
@@ -87,7 +124,66 @@ def make_workload(args, vocab_size, repeat):
     cache_warmup_prompt = shared_prefix + [
         rng.randrange(vocab_size) for _ in range(suffix_len)
     ]
-    return prompts, cache_warmup_prompt
+    arrival_rng = random.Random(args.seed + 10_000 + repeat)
+    arrival_offsets = make_arrival_offsets(
+        args.arrival_pattern,
+        args.request_rate,
+        args.num_requests,
+        arrival_rng,
+    )
+    return prompts, cache_warmup_prompt, arrival_offsets
+
+
+def run_workload(
+    llm,
+    prompts,
+    sampling_params,
+    arrival_offsets,
+    clock=None,
+    sleeper=None,
+    synchronize=None,
+):
+    if len(prompts) != len(arrival_offsets):
+        raise ValueError("prompts and arrival offsets must have equal lengths")
+    if any(offset < 0 for offset in arrival_offsets):
+        raise ValueError("arrival offsets must be non-negative")
+    if arrival_offsets != sorted(arrival_offsets):
+        raise ValueError("arrival offsets must be monotonic")
+    clock = clock or time.perf_counter
+    sleeper = sleeper or time.sleep
+    started_at = clock()
+    pending = 0
+    outputs = {}
+    while pending < len(prompts) or not llm.is_finished():
+        now = clock()
+        elapsed = now - started_at
+        while (
+            pending < len(prompts)
+            and arrival_offsets[pending] <= elapsed
+        ):
+            arrival_time = started_at + arrival_offsets[pending]
+            seq_id = llm.add_request(
+                prompts[pending],
+                sampling_params,
+                arrival_time=arrival_time,
+            )
+            outputs[seq_id] = None
+            pending += 1
+        if not llm.is_finished():
+            finished, _ = llm.step()
+            for seq_id, token_ids in finished:
+                outputs[seq_id] = {
+                    "text": llm.tokenizer.decode(token_ids),
+                    "token_ids": token_ids,
+                    "metrics": llm.take_finished_request_metrics(seq_id),
+                }
+        elif pending < len(prompts):
+            delay = arrival_offsets[pending] - elapsed
+            sleeper(min(max(delay, 0.0), 0.01))
+    if synchronize is not None:
+        synchronize()
+    elapsed = clock() - started_at
+    return [outputs[seq_id] for seq_id in sorted(outputs)], elapsed
 
 
 def main():
@@ -108,7 +204,9 @@ def main():
         scheduling_policy=args.scheduling_policy,
         prefill_chunk_size=prefill_chunk_size,
         ttft_slo_ms=args.ttft_slo_ms,
+        tpot_slo_ms=args.tpot_slo_ms,
         max_consecutive_decode_steps=args.max_consecutive_decode_steps,
+        scheduler_cost_ema_alpha=args.scheduler_cost_ema_alpha,
     )
     sampling_params = SamplingParams(
         temperature=1.0,
@@ -122,11 +220,12 @@ def main():
     )
     llm.generate([[1, 2, 3, 4]], warmup_params, use_tqdm=False)
     torch.cuda.synchronize()
+    llm.scheduler.reset_cost_estimates()
 
     runs = []
     request_metrics = []
     for repeat in range(args.repeats):
-        prompts, cache_warmup_prompt = make_workload(
+        prompts, cache_warmup_prompt, arrival_offsets = make_workload(
             args,
             llm.tokenizer.vocab_size,
             repeat,
@@ -144,10 +243,13 @@ def main():
 
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
-        started_at = time.perf_counter()
-        outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - started_at
+        outputs, elapsed = run_workload(
+            llm,
+            prompts,
+            sampling_params,
+            arrival_offsets,
+            synchronize=torch.cuda.synchronize,
+        )
 
         metrics = [output["metrics"] for output in outputs]
         request_metrics.extend(metrics)
@@ -158,6 +260,15 @@ def main():
                 "elapsed_ms": round(elapsed * 1000, 3),
                 "requests_per_second": round(args.num_requests / elapsed, 3),
                 "output_tokens_per_second": round(output_tokens / elapsed, 3),
+                "arrival_span_ms": round(arrival_offsets[-1] * 1000, 3),
+                "estimated_prefill_ms_per_token": round(
+                    (llm.scheduler.prefill_seconds_per_token or 0.0) * 1000,
+                    6,
+                ),
+                "estimated_decode_step_ms": round(
+                    (llm.scheduler.decode_step_seconds or 0.0) * 1000,
+                    3,
+                ),
                 "peak_allocated_gib": round(
                     torch.cuda.max_memory_allocated() / 1024**3,
                     3,
@@ -212,6 +323,18 @@ def main():
             "decode_ms": summarize(
                 [metric["decode_ms"] for metric in request_metrics]
             ),
+            "inter_token_gap_p95_ms": summarize(
+                [
+                    metric["inter_token_gap_p95_ms"]
+                    for metric in request_metrics
+                ]
+            ),
+            "max_inter_token_gap_ms": summarize(
+                [
+                    metric["max_inter_token_gap_ms"]
+                    for metric in request_metrics
+                ]
+            ),
             "prefill_chunks": summarize(
                 [metric["prefill_chunks"] for metric in request_metrics]
             ),
@@ -224,6 +347,21 @@ def main():
             "prefix_cache_hit_rate": round(
                 total_cache_hit_tokens / total_prompt_tokens,
                 6,
+            ),
+            "ttft_slo_violation_rate": violation_rate(
+                [metric["ttft_ms"] for metric in request_metrics],
+                args.ttft_slo_ms,
+            ),
+            "tpot_slo_violation_rate": violation_rate(
+                [metric["tpot_ms"] for metric in request_metrics],
+                args.tpot_slo_ms,
+            ),
+            "inter_token_slo_violation_rate": violation_rate(
+                [
+                    metric["max_inter_token_gap_ms"]
+                    for metric in request_metrics
+                ],
+                args.tpot_slo_ms,
             ),
             "peak_allocated_gib": max(
                 run["peak_allocated_gib"] for run in runs

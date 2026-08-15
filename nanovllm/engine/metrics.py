@@ -8,11 +8,23 @@ def _milliseconds(seconds: float | None) -> float | None:
     return round(seconds * 1000, 3)
 
 
+def _percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    values = sorted(values)
+    position = (len(values) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(values) - 1)
+    weight = position - lower
+    return values[lower] * (1 - weight) + values[upper] * weight
+
+
 @dataclass(slots=True)
 class RequestMetrics:
     arrival_time: float = field(default_factory=perf_counter)
     first_scheduled_time: float | None = None
     first_token_time: float | None = None
+    last_token_time: float | None = None
     finish_time: float | None = None
     queued_at: float | None = field(init=False)
     queue_time: float = 0.0
@@ -22,6 +34,7 @@ class RequestMetrics:
     prefill_chunks: int = 0
     decode_steps: int = 0
     preemptions: int = 0
+    inter_token_gaps: list[float] = field(default_factory=list)
 
     def __post_init__(self):
         self.queued_at = self.arrival_time
@@ -55,8 +68,12 @@ class RequestMetrics:
         )
 
     def mark_token(self, num_completion_tokens: int, now: float | None = None):
+        now = perf_counter() if now is None else now
         if num_completion_tokens == 1 and self.first_token_time is None:
-            self.first_token_time = perf_counter() if now is None else now
+            self.first_token_time = now
+        elif self.last_token_time is not None:
+            self.inter_token_gaps.append(now - self.last_token_time)
+        self.last_token_time = now
 
     def mark_finished(self, now: float | None = None):
         self.finish_time = perf_counter() if now is None else now
@@ -97,6 +114,10 @@ class RequestMetrics:
             if num_prompt_tokens
             else 0.0
         )
+        inter_token_gap_p95 = _percentile(self.inter_token_gaps, 0.95)
+        max_inter_token_gap = (
+            max(self.inter_token_gaps) if self.inter_token_gaps else None
+        )
         return {
             "prompt_tokens": num_prompt_tokens,
             "completion_tokens": num_completion_tokens,
@@ -106,6 +127,8 @@ class RequestMetrics:
             "queue_ms": _milliseconds(self.queue_time),
             "prefill_ms": _milliseconds(self.prefill_time),
             "decode_ms": _milliseconds(self.decode_time),
+            "inter_token_gap_p95_ms": _milliseconds(inter_token_gap_p95),
+            "max_inter_token_gap_ms": _milliseconds(max_inter_token_gap),
             "prefix_cache_hit_tokens": self.prefix_cache_hit_tokens,
             "prefix_cache_hit_rate": round(cache_hit_rate, 6),
             "prefill_chunks": self.prefill_chunks,

@@ -19,18 +19,26 @@ class Config:
     scheduling_policy: str = "prefill_first"
     prefill_chunk_size: int = 0
     ttft_slo_ms: float = 500.0
+    tpot_slo_ms: float = 50.0
     max_consecutive_decode_steps: int = 8
+    scheduler_cost_ema_alpha: float = 0.2
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
-        assert self.scheduling_policy in {"prefill_first", "slo_aware"}
+        assert self.scheduling_policy in {
+            "prefill_first",
+            "slo_aware",
+            "slo_aware_v2",
+        }
         if self.prefill_chunk_size == 0:
             self.prefill_chunk_size = self.max_num_batched_tokens
         assert 0 < self.prefill_chunk_size <= self.max_num_batched_tokens
         assert self.ttft_slo_ms >= 0
+        assert self.tpot_slo_ms > 0
         assert self.max_consecutive_decode_steps > 0
+        assert 0 < self.scheduler_cost_ema_alpha <= 1
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(
             self.max_model_len,

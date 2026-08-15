@@ -14,9 +14,12 @@ A lightweight vLLM implementation built from scratch.
 
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
 * 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
-* 📊 **Request observability** - TTFT, TPOT, queue, prefill, decode, cache-hit, and preemption metrics
-* 🎯 **SLO-aware scheduling** - Adaptive chunked prefill that balances new-request TTFT and active-request TPOT
+* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch
+  compilation, CUDA graph, etc.
+* 📊 **Request observability** - TTFT, TPOT, queue, prefill, decode,
+  cache-hit, and preemption metrics
+* 🎯 **SLO-aware scheduling** - Deadline-driven prefill/decode scheduling
+  with online cost estimation
 
 ## Installation
 
@@ -35,7 +38,8 @@ huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
 
 ## Quick Start
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
+See `example.py` for usage. The API mirrors vLLM's interface with minor
+differences in the `LLM.generate` method:
 ```python
 from nanovllm import LLM, SamplingParams
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
@@ -59,18 +63,24 @@ outputs[0]["metrics"]
 # }
 ```
 
-The original scheduling behavior remains the default. Enable the experimental
-policy explicitly:
+The original scheduling behavior remains the default. `slo_aware` preserves
+the first experimental policy for ablation studies. Enable the deadline-driven
+v2 policy explicitly:
 
 ```python
 llm = LLM(
     "/YOUR/MODEL/PATH",
-    scheduling_policy="slo_aware",
+    scheduling_policy="slo_aware_v2",
     prefill_chunk_size=1024,
     ttft_slo_ms=500,
+    tpot_slo_ms=50,
     max_consecutive_decode_steps=8,
 )
 ```
+
+The v2 scheduler compares normalized TTFT and TPOT deadline slack, naturally
+admits an initial decode batch until decode becomes more urgent, and sizes
+prefill chunks using an EWMA of observed model step costs.
 
 ## Benchmark
 
@@ -78,8 +88,15 @@ See `bench.py` for the original throughput benchmark.
 
 For repeatable request-level SLO experiments, see
 [`benchmarks/benchmark_slo.py`](benchmarks/benchmark_slo.py). The benchmark
-supports fixed workloads, repeated runs, shared-prefix workloads, JSON output,
-and direct comparison between `prefill_first` and `slo_aware`.
+supports bulk, constant-rate, and Poisson arrivals, repeated runs,
+shared-prefix workloads, SLO violation rates, JSON output, and direct
+comparison between all three scheduling policies.
+
+For an online workload, add:
+
+```bash
+--arrival-pattern poisson --request-rate 8
+```
 
 The 5090 experiment commands and the Chinese source-reading guide are in:
 

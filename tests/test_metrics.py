@@ -27,6 +27,8 @@ class RequestMetricsTest(unittest.TestCase):
         self.assertEqual(result["queue_ms"], 1000.0)
         self.assertEqual(result["prefill_ms"], 400.0)
         self.assertEqual(result["decode_ms"], 600.0)
+        self.assertEqual(result["inter_token_gap_p95_ms"], 1000.0)
+        self.assertEqual(result["max_inter_token_gap_ms"], 1000.0)
         self.assertEqual(result["prefix_cache_hit_rate"], 0.5)
         self.assertEqual(result["prefill_chunks"], 1)
         self.assertEqual(result["decode_steps"], 1)
@@ -43,6 +45,22 @@ class RequestMetricsTest(unittest.TestCase):
 
         self.assertEqual(result["queue_ms"], 3000.0)
         self.assertEqual(result["preemptions"], 1)
+
+    def test_inter_token_metrics_keep_tail_stalls_visible(self):
+        metrics = RequestMetrics(arrival_time=0.0)
+        metrics.mark_token(1, now=1.0)
+        metrics.mark_token(2, now=2.0)
+        metrics.mark_token(3, now=5.0)
+        metrics.mark_finished(now=5.0)
+
+        result = metrics.to_dict(
+            num_prompt_tokens=4,
+            num_completion_tokens=3,
+        )
+
+        self.assertEqual(result["tpot_ms"], 2000.0)
+        self.assertEqual(result["inter_token_gap_p95_ms"], 2900.0)
+        self.assertEqual(result["max_inter_token_gap_ms"], 3000.0)
 
 
 if __name__ == "__main__":

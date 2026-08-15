@@ -63,12 +63,17 @@ E2E  = finish_time - arrival_time
 一次 batched model step 的耗时会记到该 batch 中每个请求上，因为每个请求
 都真实等待了这段时间。
 
+TPOT 是所有 token 间隔的平均值，可能掩盖一次很长的卡顿。因此项目还记录
+每个请求的 `inter_token_gap_p95_ms` 和 `max_inter_token_gap_ms`。调度器内部
+的 `decode_ms` 只累计真正执行模型的时间，不包含中间为其他请求执行
+prefill 的墙钟等待。
+
 ## 4. 原调度与 SLO 调度
 
 `prefill_first` 保留上游行为：只要 waiting queue 中还有请求，就优先执行
 prefill。它有利于尽快接纳新请求，但可能阻塞已经开始 decode 的请求。
 
-`slo_aware` 使用四个规则：
+`slo_aware` 保留为 v1 消融基线，使用四个规则：
 
 1. prefill 后至少执行一次 decode，避免长 prompt 连续阻塞输出。
 2. 连续 decode 达到上限后推进 waiting queue，避免新请求饿死。
@@ -79,7 +84,40 @@ prefill。它有利于尽快接纳新请求，但可能阻塞已经开始 decode
 这不是“永远更快”的策略，而是可调的延迟权衡。项目实验要证明它在哪些
 工作负载下改善 P95 TTFT 或 P95 TPOT，以及付出了多少吞吐代价。
 
-## 5. Paged KV cache 与 prefix cache
+`slo_aware_v2` 针对 v1 的负实验结果增加三项机制：
+
+1. 第一次 prefill 后立即得到成本样本，再继续准入请求，直到 decode 的
+   deadline 更紧迫。初始 batch 大小因此由实测成本和 SLO 决定，而不是固定
+   为 1 或 `max_num_seqs`。
+2. waiting 请求使用 `arrival + TTFT SLO` 作为 deadline，running 请求使用
+   `last_token + TPOT SLO` 作为 deadline。两者都减去预测执行成本，再用
+   “剩余时间 / SLO 目标”归一化；值更小的一方更紧迫。
+3. Scheduler 对实测 prefill 每 token 时间和 decode step 时间维护 EWMA。
+   只有 deadline 允许时才缩小 chunk，并按 KV block 对齐；TTFT 已超期时
+   使用完整 chunk 追赶，而不是固定拆成 256 token。
+
+如果 TTFT 与 TPOT 同时超期，调度器选择归一化超期更严重的一方。这不能在
+过载时凭空满足所有目标，但能让决策和失败原因可解释。
+
+## 5. 离线批处理与在线到达
+
+一次 `LLM.generate(prompts)` 会先提交所有 prompt，属于 bulk arrival。
+这种负载通常有利于 `prefill_first`，不能代表真实服务中“decode 期间不断有
+新请求到达”的情况。
+
+`benchmark_slo.py` 支持三种到达模式：
+
+```text
+bulk      所有请求在同一时刻到达
+constant  按固定 request rate 到达
+poisson   到达间隔服从指数分布，模拟无记忆请求流
+```
+
+在线模式通过 `LLMEngine.add_request` 和 `step` 驱动，同一随机种子会生成相同
+prompt 和到达时间。比较策略时必须固定 arrival pattern、request rate 和
+seed。
+
+## 6. Paged KV cache 与 prefix cache
 
 `BlockManager` 将 KV cache 切成固定大小的 block。Sequence 保存逻辑
 `block_table`，Attention 根据它找到物理 cache block。
@@ -90,7 +128,7 @@ prefill。它有利于尽快接纳新请求，但可能阻塞已经开始 decode
 
 prefix cache 命中率是“复用的 prompt token / prompt token”，不是请求命中数。
 
-## 6. Triton KV 写入 kernel
+## 7. Triton KV 写入 kernel
 
 `store_kvcache_kernel` 的每个 Triton program 负责一个输入 token：
 
@@ -106,7 +144,7 @@ Qwen3-8B 的 `D=1024` 不增加 padding。
 检查，并报告小 batch（decode）和大 batch（prefill）下的耗时及有效带宽。
 只有实测后才应该修改 `num_warps`、program 粒度或向量化方式。
 
-## 7. 推荐复盘问题
+## 8. 推荐复盘问题
 
 完成实验后，应该能独立回答：
 
@@ -116,3 +154,5 @@ Qwen3-8B 的 `D=1024` 不增加 padding。
 4. prefix cache 为什么只能稳定复用完整 block？
 5. CUDA Graph 为什么主要优化 decode，而不是动态长度的 prefill？
 6. kernel 更快时，为什么端到端吞吐可能几乎不变？
+7. 为什么 decode kernel P95 下降时，用户看到的 TPOT 仍可能上升？
+8. 为什么 bulk workload 不能单独证明在线调度策略有效？
