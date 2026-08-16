@@ -2,122 +2,196 @@
 <img width="300" src="assets/logo.png">
 </p>
 
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
+# learn-nano-vllm: SLO-aware inference lab
 
-# Nano-vLLM
+这是一个基于
+[GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)
+构建的单卡 LLM 推理实验项目。它保留了小型、可读的推理引擎主体，并围绕
+在线请求调度、流式尾延迟、prefix cache 和 Triton kernel 建立了一条
+可复现的 RTX 5090 实验链。
 
-A lightweight vLLM implementation built from scratch.
+项目目标不是堆叠功能，而是回答三个可以被数据验证的问题：
 
-## Key Features
+1. 长 prefill 如何导致正在生成的请求发生 decode starvation？
+2. 调度器如何在 TTFT、流式平滑度和吞吐之间做明确的 SLO 权衡？
+3. 一个更快的 GPU kernel，最终能在端到端 TPOT 中贡献多少？
 
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch
-  compilation, CUDA graph, etc.
-* 📊 **Request observability** - TTFT, TPOT, queue, prefill, decode,
-  cache-hit, and preemption metrics
-* 🎯 **SLO-aware scheduling** - Deadline-driven prefill/decode scheduling
-  with online cost estimation
+## 核心结果
 
-## Installation
+| 实验 | Baseline | 改造后 | 结论 |
+|---|---:|---:|---|
+| 8B held-out Max ITL P95 | 259.21ms | 68.23ms | 降低 73.7% |
+| 8B 请求发生 Max ITL > 75ms | 93.8% | 0.6% | 约 300/320 降至 2/320 |
+| 8B output tok/s | 255.56 | 255.16 | 下降 0.16% |
+| 8B E2E P95 | 2180.29ms | 2353.69ms | 为流式平滑度付出 8.0% |
+| 8B prefix-cache TTFT P95 | 211.59ms | 95.14ms | 50% cache hit 下缩短 55.0% |
+| KV-store microbenchmark | PyTorch | Triton 1.73--2.90x | 端到端 TPOT 改善 1.52% |
+| RMSNorm microbenchmark | eager | Triton 3.2--8.7x | 未稳定胜过原有 torch.compile |
 
-```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+最终选择不是“所有指标都更低”，而是在固定验收阈值下：
+
+- TTFT 违反率保持 0%；
+- Max ITL 违反率从 93.8% 降至 0.6%；
+- 吞吐基本不变；
+- 明确记录 E2E P95 增加的代价。
+
+完整数据、负实验和限制见
+[`docs/slo-v2-results-zh.md`](docs/slo-v2-results-zh.md)。
+
+## 系统结构
+
+```mermaid
+flowchart LR
+    A["Bulk / Constant / Poisson arrivals"] --> S["Scheduler"]
+    S --> P["Prefill queue"]
+    S --> D["Decode queue"]
+    S --> B["Paged KV BlockManager"]
+    P --> M["Qwen3 ModelRunner"]
+    D --> M
+    B --> K["KV cache / Prefix cache"]
+    M --> N["RMSNorm · RoPE · Attention · GEMM"]
+    N --> F["FlashAttention / CUDA Graph"]
+    M --> O["Generated tokens"]
+    S --> R["Request metrics"]
+    O --> R
+    R --> J["JSON · SLO violations · Markdown comparison"]
 ```
 
-## Model Download
+一次请求的指标生命周期覆盖 arrival、queue、prefill chunks、first token、
+decode steps 和 finish。调度器使用同一套运行时指标估算 prefill 与 decode
+成本，而 benchmark 使用请求级时间戳计算 TTFT、TPOT、Max ITL 和违反率。
 
-To download the model weights manually, use the following command:
-```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
+## 主要改造
+
+### SLO-aware scheduler v2
+
+原始 `prefill_first` 保留为 baseline，失败的 `slo_aware` v1 也保留为
+ablation。v2 的核心机制包括：
+
+- 使用 TTFT/TPOT deadline 的归一化 slack 选择 prefill 或 decode；
+- waiting 请求采用 least-laxity-first；
+- 根据 decode slack 动态决定 prefill chunk，而不是固定切成小块；
+- 使用运行时 EWMA 估计 prefill token cost 和 decode step cost；
+- decode 请求 round-robin，避免单个请求长期占用执行机会。
+
+入口代码：
+
+- [`nanovllm/engine/scheduler.py`](nanovllm/engine/scheduler.py)
+- [`nanovllm/engine/metrics.py`](nanovllm/engine/metrics.py)
+- [`nanovllm/config.py`](nanovllm/config.py)
+
+### 可复现的在线 benchmark
+
+[`benchmarks/benchmark_slo.py`](benchmarks/benchmark_slo.py) 支持：
+
+- bulk、constant-rate 和 seeded Poisson arrivals；
+- 固定长度、重复次数、随机种子与 shared prefix；
+- TTFT、TPOT、ITL、Max ITL、queue、chunks、吞吐和显存；
+- 独立的配置 SLO 与固定验收阈值；
+- KV-store 和 RMSNorm 后端 A/B。
+
+[`benchmarks/compare_results.py`](benchmarks/compare_results.py) 将多个 JSON
+结果整理成可直接放进报告的 Markdown 表格。
+
+### Kernel 路线
+
+KV-cache 写入实验形成了完整的 micro-to-macro 证据：
+
+1. 逐元素正确性检查；
+2. 支持 `D` 不是 2 的幂的 masked Triton block；
+3. PyTorch 与 Triton 微基准；
+4. 按 36 层预测每个 decode step 的节省；
+5. 端到端 A/B 验证预测。
+
+RMSNorm/Add+RMSNorm 则是一项有意保留的负实验：Triton 在大 prefill
+形状上最高比 `torch.compile` 快约 1.5 倍，但 decode 关键形状胜负混合，
+端到端 TPOT 反而变化 +0.35%。因此默认实现继续使用 `torch.compile`，
+Triton 只作为实验后端。
+
+入口代码：
+
+- [`nanovllm/layers/attention.py`](nanovllm/layers/attention.py)
+- [`nanovllm/layers/layernorm.py`](nanovllm/layers/layernorm.py)
+- [`benchmarks/kernels/`](benchmarks/kernels/)
+
+## 环境与验证
+
+已验证的主要环境：
+
+```text
+GPU             NVIDIA GeForce RTX 5090 32GB
+PyTorch         2.8.0+cu128
+Triton          3.4.0
+FlashAttention  2.8.3
+Model           Qwen3-0.6B / Qwen3-8B
 ```
 
-## Quick Start
+克隆实验分支：
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor
-differences in the `LLM.generate` method:
+```bash
+git clone https://github.com/YukiSama0714/learn-nano-vllm.git
+cd learn-nano-vllm
+git switch codex/slo-aware-scheduler
+```
+
+Hugging Face 网络受限时可优先指定镜像：
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+.venv/bin/hf download Qwen/Qwen3-8B \\
+  --local-dir /YOUR/MODEL/PATH \\
+  --max-workers 2
+```
+
+运行完整测试：
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+复现实验前先阅读：
+
+- [`docs/rtx5090-experiments.md`](docs/rtx5090-experiments.md)
+- [`docs/learning-guide-zh.md`](docs/learning-guide-zh.md)
+- [`docs/slo-v2-results-zh.md`](docs/slo-v2-results-zh.md)
+
+## Quick start
+
 ```python
 from nanovllm import LLM, SamplingParams
-llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
-sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
-outputs = llm.generate(prompts, sampling_params)
-outputs[0]["text"]
-```
 
-Each output also contains request-level metrics:
-
-```python
-outputs[0]["metrics"]
-# {
-#   "ttft_ms": ...,
-#   "tpot_ms": ...,
-#   "e2e_ms": ...,
-#   "queue_ms": ...,
-#   "prefix_cache_hit_rate": ...,
-#   ...
-# }
-```
-
-The original scheduling behavior remains the default. `slo_aware` preserves
-the first experimental policy for ablation studies. Enable the deadline-driven
-v2 policy explicitly:
-
-```python
 llm = LLM(
     "/YOUR/MODEL/PATH",
     scheduling_policy="slo_aware_v2",
     prefill_chunk_size=1024,
     ttft_slo_ms=500,
-    tpot_slo_ms=50,
-    max_consecutive_decode_steps=8,
+    tpot_slo_ms=75,
+    max_num_seqs=8,
 )
+outputs = llm.generate(
+    ["Explain why a long prefill can stall decode."],
+    SamplingParams(temperature=0.6, max_tokens=128),
+)
+print(outputs[0]["text"])
+print(outputs[0]["metrics"])
 ```
 
-The v2 scheduler compares normalized TTFT and TPOT deadline slack, naturally
-admits an initial decode batch until decode becomes more urgent, and sizes
-prefill chunks using an EWMA of observed model step costs.
+原始 `prefill_first` 仍是默认策略；实验策略必须显式开启。RMSNorm 默认
+后端也仍是原有的 `compiled`。
 
-## Benchmark
+## 诚实边界
 
-See `bench.py` for the original throughput benchmark.
+- 只验证了单张 RTX 5090 和 Qwen3 模型族；
+- benchmark 不包含 HTTP、tokenization 和真实生产流量；
+- Poisson offered load 下的 tok/s 不等于峰值离线吞吐；
+- mixed-length、长上下文和多卡通信尚未形成同等强度的证据；
+- Triton microbenchmark 的倍数不能直接当作端到端加速。
 
-For repeatable request-level SLO experiments, see
-[`benchmarks/benchmark_slo.py`](benchmarks/benchmark_slo.py). The benchmark
-supports bulk, constant-rate, and Poisson arrivals, repeated runs,
-shared-prefix workloads, SLO violation rates, JSON output, and direct
-comparison between all three scheduling policies.
+## Upstream
 
-For an online workload, add:
-
-```bash
---arrival-pattern poisson --request-rate 8
-```
-
-The 5090 experiment commands and the Chinese source-reading guide are in:
-
-* [`docs/rtx5090-experiments.md`](docs/rtx5090-experiments.md)
-* [`docs/learning-guide-zh.md`](docs/learning-guide-zh.md)
-* [`docs/slo-v2-results-zh.md`](docs/slo-v2-results-zh.md)
-
-**Upstream Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
-
-**Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
-
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+本项目基于
+[GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)
+进行学习与实验。上游项目提供了精简的 vLLM-style 推理主体、Paged KV
+cache、prefix caching、Tensor Parallelism、CUDA Graph 和
+FlashAttention 集成；本 fork 的重点是可观测的在线调度与 RTX 5090
+实验方法。
