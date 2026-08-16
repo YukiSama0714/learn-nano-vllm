@@ -1,5 +1,9 @@
 # RTX 5090 四天实验计划
 
+v3 的 mixed batch、细粒度 PagedAttention、greedy 金标和 speculative
+decoding 命令已单独整理到 [`v3-design-zh.md`](v3-design-zh.md)。本文件保留
+v1/v2 基线，不能删除这些负实验数据。
+
 目标不是跑出一个最大的 tokens/s，而是得到可以复现、可以解释的
 吞吐—延迟—显存权衡。
 

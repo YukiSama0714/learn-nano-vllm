@@ -16,6 +16,11 @@
 2. 调度器如何在 TTFT、流式平滑度和吞吐之间做明确的 SLO 权衡？
 3. 一个更快的 GPU kernel，最终能在端到端 TPOT 中贡献多少？
 
+v3 实验分支进一步加入统一 mixed-batch 调度、16/32/64-token Triton
+PagedAttention，以及 greedy 无损的 n-gram / Qwen3 draft 推测解码。实现与
+5090 验收命令见 [`docs/v3-design-zh.md`](docs/v3-design-zh.md)。v3 的 GPU
+性能数据尚未写入下方“核心结果”；在验收 JSON 产生前不提前宣称收益。
+
 ## 核心结果
 
 | 实验 | Baseline | 改造后 | 结论 |
@@ -89,6 +94,8 @@ ablation。v2 的核心机制包括：
 - TTFT、TPOT、ITL、Max ITL、queue、chunks、吞吐和显存；
 - 独立的配置 SLO 与固定验收阈值；
 - KV-store 和 RMSNorm 后端 A/B。
+- mixed-length 输入、逐步阶段耗时、KV 尾块浪费和推测接受率；
+- schema、Git commit、依赖版本、模型摘要和 greedy token 金标。
 
 [`benchmarks/compare_results.py`](benchmarks/compare_results.py) 将多个 JSON
 结果整理成可直接放进报告的 Markdown 表格。
@@ -155,6 +162,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 - [`docs/learning-guide-zh.md`](docs/learning-guide-zh.md)
 - [`docs/slo-v2-results-zh.md`](docs/slo-v2-results-zh.md)
 - [`docs/interview-guide-zh.md`](docs/interview-guide-zh.md)
+- [`docs/v3-design-zh.md`](docs/v3-design-zh.md)
 - [`docs/course/00-syllabus.md`](docs/course/00-syllabus.md)
 
 ## Quick start
