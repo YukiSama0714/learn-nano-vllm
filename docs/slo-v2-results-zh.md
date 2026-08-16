@@ -168,7 +168,53 @@ Triton 相对 PyTorch 每层节省 `0.011105 - 0.004094 = 0.007011ms`，
 声称峰值吞吐提升。该 A/B 的结论是：Triton kernel 的微观收益可以
 在系统 TPOT 中观测，但它只占约 1.5%，不是下一个值得手调的瓶颈。
 
-## 8. 局限性
+## 8. RMSNorm 的混合结果
+
+第二个算子实验比较 eager PyTorch、原有 `torch.compile` 和
+Triton RMSNorm/Add+RMSNorm。Q/K 微基准保留了融合 QKV
+投影 `split` 产生的非连续 batch stride。
+
+| 算子/场景 | Rows | D | Compiled ms | Triton ms | Triton vs compiled |
+|---|---:|---:|---:|---:|---:|
+| Q Norm, 1 token | 32 | 128 | 0.003782 | 0.004418 | 0.856x |
+| Q Norm, 8 tokens | 256 | 128 | 0.004429 | 0.003815 | 1.161x |
+| Q Norm, large prefill | 32768 | 128 | 0.018127 | 0.018944 | 0.957x |
+| K Norm, 1 token | 8 | 128 | 0.003778 | 0.004420 | 0.855x |
+| K Norm, 8 tokens | 64 | 128 | 0.004414 | 0.003782 | 1.167x |
+| RMSNorm, batch 1 | 1 | 4096 | 0.004216 | 0.004439 | 0.950x |
+| RMSNorm, large prefill | 4096 | 4096 | 0.044801 | 0.029861 | 1.500x |
+| Add+RMSNorm, batch 1 | 1 | 4096 | 0.004752 | 0.003822 | 1.244x |
+| Add+RMSNorm, batch 8 | 8 | 4096 | 0.004115 | 0.004461 | 0.923x |
+| Add+RMSNorm, large prefill | 4096 | 4096 | 0.116717 | 0.076781 | 1.520x |
+
+Triton 相对 eager 快 3.2--8.7 倍，但原项目已经使用
+`torch.compile`，因此这不是有效的替换依据。Triton 在大 prefill
+形状上可达到 1.5 倍加速，但 decode 小 batch 上胜负混合。
+与 eager 相比的最大绝对误差为 0.015625--0.03125，通过 BF16
+容差验收，但不是 bit-exact。
+
+按 Qwen3-8B 的 36 层加权，每个 decode step 包含约 36 次
+Q Norm、36 次 K Norm 和 72 次 Add+RMSNorm。微基准预测
+batch 1/8 都只节省约 0.02ms，约为 17.4ms TPOT 的 0.1%。
+
+使用新 seed 9001、相同 8B Poisson 2 req/s workload 进行端到端
+A/B：
+
+| 指标 | Compiled | Triton | Triton 变化 |
+|---|---:|---:|---:|
+| TTFT P95 ms | 198.53 | 200.02 | +0.75% |
+| TPOT P95 ms | 17.38 | 17.44 | +0.35% |
+| Max ITL P95 ms | 68.14 | 68.22 | +0.12% |
+| E2E P95 ms | 2393.91 | 2401.64 | +0.32% |
+| ITL violations > 75ms | 0.6% | 0.6% | 0.0pp |
+| Output tok/s | 244.40 | 244.41 | +0.00% |
+| Peak GiB | 27.34 | 27.34 | 0.00% |
+
+所有变化都在 1% 以内，且 TPOT 方向与微基准的 0.1% 预测相反，
+说明预期收益已小于系统噪声。因此项目保留 Triton 作为实验
+后端和大 prefill 研究起点，默认后端继续使用 `torch.compile`。
+
+## 9. 局限性
 
 1. 仅测试单张 RTX 5090 和 Qwen3 模型族。
 2. 使用固定长度的随机 token prompt，没有 HTTP、tokenization 或真实流量。
