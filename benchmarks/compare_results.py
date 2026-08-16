@@ -53,6 +53,7 @@ def main():
     headers = [
         "Result",
         "Policy",
+        "KV store",
         "Arrival",
         "Req/s",
         "Chunk",
@@ -93,6 +94,7 @@ def main():
         row = [
             path.stem,
             config["scheduling_policy"],
+            config.get("kv_store_backend", "triton"),
             config.get("arrival_pattern", "bulk"),
             format_number(config.get("request_rate")),
             str(config["prefill_chunk_size"]),

@@ -1,8 +1,11 @@
 import random
 import unittest
 
+import torch
+
 from benchmarks.benchmark_slo import (
     make_arrival_offsets,
+    pytorch_store_kvcache,
     run_workload,
     violation_rate,
 )
@@ -55,6 +58,25 @@ class FakeLlm:
 
 
 class BenchmarkSloTest(unittest.TestCase):
+
+    def test_pytorch_kv_store_writes_selected_slots(self):
+        key = torch.arange(12).reshape(2, 2, 3)
+        value = key + 100
+        k_cache = torch.zeros(1, 4, 2, 3, dtype=key.dtype)
+        v_cache = torch.zeros_like(k_cache)
+
+        pytorch_store_kvcache(
+            key,
+            value,
+            k_cache,
+            v_cache,
+            torch.tensor([3, 1], dtype=torch.int32),
+        )
+
+        torch.testing.assert_close(k_cache.view(4, 2, 3)[3], key[0])
+        torch.testing.assert_close(k_cache.view(4, 2, 3)[1], key[1])
+        torch.testing.assert_close(v_cache.view(4, 2, 3)[3], value[0])
+        torch.testing.assert_close(v_cache.view(4, 2, 3)[1], value[1])
 
     def test_bulk_arrivals_share_the_same_offset(self):
         offsets = make_arrival_offsets(

@@ -10,6 +10,20 @@ import torch
 from nanovllm import LLM, SamplingParams
 
 
+def pytorch_store_kvcache(
+    key,
+    value,
+    k_cache,
+    v_cache,
+    slot_mapping,
+):
+    flat_k_cache = k_cache.view(-1, key.size(1), key.size(2))
+    flat_v_cache = v_cache.view(-1, value.size(1), value.size(2))
+    indices = slot_mapping.long()
+    flat_k_cache[indices] = key
+    flat_v_cache[indices] = value
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Benchmark request-level nano-vLLM latency and throughput."
@@ -35,6 +49,11 @@ def parse_args():
     parser.add_argument("--tpot-slo-ms", type=float, default=50.0)
     parser.add_argument("--max-consecutive-decode-steps", type=int, default=8)
     parser.add_argument("--scheduler-cost-ema-alpha", type=float, default=0.2)
+    parser.add_argument(
+        "--kv-store-backend",
+        choices=("triton", "pytorch"),
+        default="triton",
+    )
     parser.add_argument(
         "--arrival-pattern",
         choices=("bulk", "constant", "poisson"),
@@ -68,6 +87,10 @@ def parse_args():
         parser.error("--scheduler-cost-ema-alpha must be in (0, 1]")
     if args.arrival_pattern != "bulk" and args.request_rate <= 0:
         parser.error("--request-rate must be positive for online arrivals")
+    if args.kv_store_backend == "pytorch" and args.shared_prefix_len:
+        parser.error(
+            "the PyTorch KV-store baseline does not support prefix-cache hits"
+        )
     return args
 
 
@@ -192,6 +215,10 @@ def run_workload(
 
 def main():
     args = parse_args()
+    if args.kv_store_backend == "pytorch":
+        import nanovllm.layers.attention as attention
+
+        attention.store_kvcache = pytorch_store_kvcache
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     prefill_chunk_size = (

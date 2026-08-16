@@ -178,6 +178,17 @@ prefill_chunk_size = 256, 512, 1024, 2048
 `1/8` 近似 decode 场景，`512/4096` 近似 prefill 场景。修改 kernel 后必须
 同时满足：逐元素结果一致、各尺度无明显回退、端到端指标能够解释。
 
+微基准完成后，用相同 workload 做端到端 A/B，两次命令只改：
+
+```bash
+--kv-store-backend triton
+--kv-store-backend pytorch
+```
+
+PyTorch 后端是为 naive/optimized 对照保留的 benchmark-only 基线，
+不支持 `--shared-prefix-len` 产生的 prefix-cache 命中，也不改变推理
+引擎默认使用 Triton 的行为。
+
 ## 7. 最终报告最少包含
 
 1. 固定的软件版本、GPU、模型和 workload。

@@ -137,6 +137,37 @@ TPOT 比较，才能估算整体收益。因此本项目将该 kernel 作为
 “正确性 + 非 2 的幂形状支持 + naive/optimized 对照”的算子案例，
 而不声称它解决了端到端瓶颈。
 
+### 7.1 从微基准预测端到端收益
+
+Qwen3-8B 共有 36 层。根据单 token、`D=1024` 的微基准，
+Triton 相对 PyTorch 每层节省 `0.011105 - 0.004094 = 0.007011ms`，
+因此预测每个 decode step 节省：
+
+```text
+0.007011ms * 36 = 0.2524ms
+```
+
+使用相同 Qwen3-8B、Poisson 2 req/s、seed 4242、320 个请求和
+`slo_aware_v2 / 75ms`，仅替换 KV 写入实现：
+
+| 指标 | Triton | PyTorch | Triton 变化 |
+|---|---:|---:|---:|
+| TTFT P95 ms | 214.97 | 212.03 | +1.39% |
+| TPOT P95 ms | 17.44 | 17.71 | -1.52% |
+| Max ITL P95 ms | 68.03 | 68.78 | -1.09% |
+| E2E P95 ms | 2348.45 | 2387.72 | -1.64% |
+| Output tok/s | 255.18 | 254.99 | +0.07% |
+| Peak GiB | 27.34 | 27.34 | 0.00% |
+
+实测 TPOT 节省 0.27ms，与预测的 0.2524ms 相差约 7%。E2E P95
+降低 39.27ms，也与 128-token 生成过程中逐 step 累积的收益数量级
+一致。TTFT 的小幅反向变化没有超过系统噪声，两组的 SLO 违反率也
+相同。
+
+`Output tok/s` 在 2 req/s 下主要受 offered load 限制，因此不用它
+声称峰值吞吐提升。该 A/B 的结论是：Triton kernel 的微观收益可以
+在系统 TPOT 中观测，但它只占约 1.5%，不是下一个值得手调的瓶颈。
+
 ## 8. 局限性
 
 1. 仅测试单张 RTX 5090 和 Qwen3 模型族。
@@ -144,4 +175,5 @@ TPOT 比较，才能估算整体收益。因此本项目将该 kernel 作为
 3. Poisson 实验的 tok/s 受 offered load 限制，不代表峰值离线吞吐。
 4. EWMA 成本与 batch size、prompt 长度有关，混合长度负载仍需验证。
 5. Held-out 有 320 个请求，足以验证方向，但不能替代生产规模压测。
-6. Kernel 数据来自独立微基准，尚未通过端到端 A/B 归因整机收益。
+6. Kernel 端到端 A/B 只覆盖一组 8B 在线负载，尚未扫描 batch size
+   和 prompt 长度对 kernel 收益的影响。
