@@ -1,6 +1,6 @@
 import unittest
-from types import SimpleNamespace
 from time import perf_counter
+from types import SimpleNamespace
 
 from nanovllm import SamplingParams
 from nanovllm.engine.scheduler import Scheduler
@@ -14,6 +14,8 @@ def make_config(
     tpot_slo_ms=50.0,
     max_num_seqs=4,
     cost_ema_alpha=0.2,
+    speculative_method="none",
+    num_speculative_tokens=4,
 ):
     return SimpleNamespace(
         max_num_seqs=max_num_seqs,
@@ -27,11 +29,14 @@ def make_config(
         eos=-1,
         kvcache_block_size=4,
         num_kvcache_blocks=32,
+        speculative_method=speculative_method,
+        num_speculative_tokens=num_speculative_tokens,
+        ngram_min=2,
+        ngram_max=5,
     )
 
 
 class SchedulerTest(unittest.TestCase):
-
     def setUp(self):
         self.original_block_size = Sequence.block_size
         Sequence.block_size = 4
@@ -204,9 +209,7 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(scheduler._prefill_token_budget_v2(), 4)
 
     def test_v2_updates_cost_estimates_with_ema(self):
-        scheduler = Scheduler(
-            make_config(policy="slo_aware_v2", cost_ema_alpha=0.5)
-        )
+        scheduler = Scheduler(make_config(policy="slo_aware_v2", cost_ema_alpha=0.5))
         seq = Sequence(list(range(8)), self.sampling_params)
         seq.num_scheduled_tokens = 8
 
@@ -223,9 +226,7 @@ class SchedulerTest(unittest.TestCase):
         self.assertIsNone(scheduler.decode_step_seconds)
 
     def test_v2_prefills_least_lax_waiting_request_first(self):
-        scheduler = Scheduler(
-            make_config(policy="slo_aware_v2", chunk_size=8)
-        )
+        scheduler = Scheduler(make_config(policy="slo_aware_v2", chunk_size=8))
         arrival_time = perf_counter()
         short = Sequence(
             list(range(4)),
@@ -267,6 +268,241 @@ class SchedulerTest(unittest.TestCase):
         self.assertTrue(is_prefill)
         self.assertEqual(scheduled, [second])
         self.assertEqual(second.metrics.prefix_cache_hit_tokens, 4)
+
+    def test_v3_mixes_decode_and_prefill_in_one_step(self):
+        scheduler = Scheduler(
+            make_config(
+                policy="slo_aware_v3",
+                chunk_size=4,
+                max_num_seqs=2,
+            )
+        )
+        running = self.add_running_sequence(scheduler)
+        waiting = Sequence(list(range(12)), self.sampling_params)
+        scheduler.add(waiting)
+
+        output = scheduler.schedule()
+
+        self.assertTrue(output.is_mixed)
+        self.assertEqual(output.num_decode_tokens, 1)
+        self.assertEqual(output.num_prefill_tokens, 4)
+        self.assertEqual(
+            {request.sequence for request in output.scheduled_requests},
+            {running, waiting},
+        )
+
+    def test_v3_reserves_decode_before_more_urgent_prefill(self):
+        scheduler = Scheduler(
+            make_config(
+                policy="slo_aware_v3",
+                chunk_size=8,
+                max_num_seqs=1,
+                ttft_slo_ms=1,
+            )
+        )
+        running = self.add_running_sequence(scheduler)
+        waiting = Sequence(
+            list(range(12)),
+            self.sampling_params,
+            arrival_time=perf_counter() - 1,
+        )
+        scheduler.add(waiting)
+
+        output = scheduler.schedule()
+
+        self.assertTrue(output.is_decode_only)
+        self.assertEqual(output.sequences, [running])
+
+    def test_v3_sizes_prefill_against_selected_decode_budget(self):
+        scheduler = Scheduler(
+            make_config(
+                policy="slo_aware_v3",
+                chunk_size=8,
+                max_num_seqs=2,
+                tpot_slo_ms=10,
+            )
+        )
+        running = self.add_running_sequence(scheduler)
+        running.metrics.mark_token(1, perf_counter())
+        scheduler.add(Sequence(list(range(12)), self.sampling_params))
+        scheduler.prefill_seconds_per_token = 0.002
+        scheduler.decode_step_seconds = 0.002
+
+        output = scheduler.schedule()
+        prefill_request = next(
+            request for request in output.scheduled_requests if request.is_prefill
+        )
+
+        self.assertEqual(prefill_request.num_scheduled_tokens, 4)
+
+    def test_v3_allows_multiple_partial_prefills(self):
+        scheduler = Scheduler(
+            make_config(
+                policy="slo_aware_v3",
+                chunk_size=4,
+                max_num_seqs=2,
+            )
+        )
+        first = Sequence(list(range(12)), self.sampling_params)
+        second = Sequence(list(range(12, 24)), self.sampling_params)
+        scheduler.add(first)
+        scheduler.add(second)
+
+        output = scheduler.schedule()
+
+        self.assertTrue(output.is_prefill_only)
+        self.assertEqual(len(output.scheduled_requests), 2)
+        self.assertEqual(output.num_prefill_tokens, 8)
+        self.assertFalse(
+            any(request.needs_sampling for request in output.scheduled_requests)
+        )
+        scheduler.postprocess(output, [None, None])
+        self.assertEqual(first.num_cached_tokens, 4)
+        self.assertEqual(second.num_cached_tokens, 4)
+
+    def test_v3_records_mixed_cost_bucket(self):
+        scheduler = Scheduler(
+            make_config(
+                policy="slo_aware_v3",
+                chunk_size=4,
+                max_num_seqs=2,
+            )
+        )
+        self.add_running_sequence(scheduler)
+        scheduler.add(Sequence(list(range(12)), self.sampling_params))
+        output = scheduler.schedule()
+
+        scheduler.postprocess(output, [7, None], step_duration=0.02)
+
+        key = (
+            scheduler._cost_bucket(output.num_prefill_tokens),
+            scheduler._cost_bucket(1),
+        )
+        self.assertEqual(scheduler.mixed_step_seconds[key], 0.02)
+
+    def test_v3_ngram_partial_acceptance_commits_only_verified_kv(self):
+        scheduler = Scheduler(
+            make_config(
+                policy="slo_aware_v3",
+                max_num_seqs=1,
+                speculative_method="ngram",
+            )
+        )
+        sequence = Sequence(
+            [1, 2, 3, 1, 2],
+            SamplingParams(
+                temperature=0,
+                max_tokens=8,
+                ignore_eos=True,
+            ),
+        )
+        scheduler.block_manager.allocate(sequence, num_cached_blocks=0)
+        sequence.num_cached_tokens = len(sequence) - 1
+        sequence.status = SequenceStatus.RUNNING
+        scheduler.running.append(sequence)
+
+        output = scheduler.schedule()
+
+        request = output.scheduled_requests[0]
+        self.assertEqual(request.speculative_token_ids, [3, 1, 2])
+        scheduler.postprocess(output, [[3, 9, 8, 7]])
+        self.assertEqual(sequence.completion_token_ids, [3, 9])
+        self.assertEqual(sequence.num_cached_tokens, 6)
+        self.assertEqual(request.accepted_tokens, 1)
+        self.assertEqual(sequence.metrics.proposed_tokens, 3)
+        self.assertEqual(sequence.metrics.accepted_tokens, 1)
+
+    def test_speculation_rejects_non_greedy_request(self):
+        scheduler = Scheduler(
+            make_config(
+                policy="slo_aware_v3",
+                speculative_method="ngram",
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "greedy"):
+            scheduler.add(Sequence([1, 2, 1, 2], self.sampling_params))
+
+    def test_v3_draft_reserves_verification_tokens(self):
+        scheduler = Scheduler(
+            make_config(
+                policy="slo_aware_v3",
+                max_num_seqs=1,
+                speculative_method="draft",
+                num_speculative_tokens=4,
+            )
+        )
+        sequence = Sequence(
+            [1, 2, 3, 4],
+            SamplingParams(
+                temperature=0,
+                max_tokens=8,
+                ignore_eos=True,
+            ),
+        )
+        scheduler.block_manager.allocate(sequence, num_cached_blocks=0)
+        sequence.num_cached_tokens = len(sequence) - 1
+        sequence.status = SequenceStatus.RUNNING
+        scheduler.running.append(sequence)
+
+        output = scheduler.schedule()
+        request = output.scheduled_requests[0]
+
+        self.assertEqual(request.speculative_method, "draft")
+        self.assertEqual(request.num_scheduled_tokens, 5)
+        self.assertEqual(len(sequence.block_table), 2)
+
+    def test_speculative_eos_stops_accepted_suffix(self):
+        scheduler = Scheduler(
+            make_config(
+                policy="slo_aware_v3",
+                max_num_seqs=1,
+                speculative_method="ngram",
+            )
+        )
+        scheduler.eos = 3
+        sequence = Sequence(
+            [1, 2, 3, 1, 2],
+            SamplingParams(temperature=0, max_tokens=8),
+        )
+        scheduler.block_manager.allocate(sequence, num_cached_blocks=0)
+        sequence.num_cached_tokens = len(sequence) - 1
+        sequence.status = SequenceStatus.RUNNING
+        scheduler.running.append(sequence)
+        output = scheduler.schedule()
+
+        scheduler.postprocess(output, [[3, 1, 2, 8]])
+
+        self.assertTrue(sequence.is_finished)
+        self.assertEqual(sequence.completion_token_ids, [3])
+        self.assertEqual(len(sequence.block_table), 0)
+
+    def test_speculation_respects_max_tokens(self):
+        scheduler = Scheduler(
+            make_config(
+                policy="slo_aware_v3",
+                max_num_seqs=1,
+                speculative_method="ngram",
+            )
+        )
+        sequence = Sequence(
+            [1, 2, 3, 1, 2],
+            SamplingParams(
+                temperature=0,
+                max_tokens=2,
+                ignore_eos=True,
+            ),
+        )
+        scheduler.block_manager.allocate(sequence, num_cached_blocks=0)
+        sequence.num_cached_tokens = len(sequence) - 1
+        sequence.status = SequenceStatus.RUNNING
+        scheduler.running.append(sequence)
+        output = scheduler.schedule()
+
+        scheduler.postprocess(output, [[3, 9]])
+
+        self.assertTrue(sequence.is_finished)
+        self.assertEqual(sequence.completion_token_ids, [3, 9])
 
 
 if __name__ == "__main__":

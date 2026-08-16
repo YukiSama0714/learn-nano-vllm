@@ -55,6 +55,11 @@ def main():
         "Policy",
         "KV store",
         "RMSNorm",
+        "Attention",
+        "Block",
+        "Speculation",
+        "Mixed steps",
+        "Acceptance",
         "Arrival",
         "Req/s",
         "Chunk",
@@ -97,13 +102,15 @@ def main():
             config["scheduling_policy"],
             config.get("kv_store_backend", "triton"),
             config.get("rms_norm_backend", "compiled"),
+            config.get("attention_backend", "flash_attn"),
+            str(config.get("kvcache_block_size", 256)),
+            config.get("speculative_method", "none"),
+            format_rate(summary.get("steps", {}).get("mixed_step_rate")),
+            format_rate(summary.get("steps", {}).get("acceptance_rate")),
             config.get("arrival_pattern", "bulk"),
             format_number(config.get("request_rate")),
             str(config["prefill_chunk_size"]),
-            (
-                f"{config.get('ttft_slo_ms', '-')}/"
-                f"{config.get('tpot_slo_ms', '-')}"
-            ),
+            (f"{config.get('ttft_slo_ms', '-')}/{config.get('tpot_slo_ms', '-')}"),
             format_number(summary_percentile(summary, "ttft_ms", "p95")),
             format_number(summary_percentile(summary, "tpot_ms", "p95")),
             format_number(
@@ -121,9 +128,7 @@ def main():
                 )
             ),
             format_number(summary_percentile(summary, "queue_ms", "p95")),
-            format_number(
-                summary_percentile(summary, "prefill_chunks", "p95")
-            ),
+            format_number(summary_percentile(summary, "prefill_chunks", "p95")),
             format_number(summary_percentile(summary, "e2e_ms", "p95")),
             format_rate(ttft_violation_rate),
             format_rate(itl_violation_rate),

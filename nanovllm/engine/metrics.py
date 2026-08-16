@@ -34,6 +34,8 @@ class RequestMetrics:
     prefill_chunks: int = 0
     decode_steps: int = 0
     preemptions: int = 0
+    proposed_tokens: int = 0
+    accepted_tokens: int = 0
     inter_token_gaps: list[float] = field(default_factory=list)
 
     def __post_init__(self):
@@ -82,6 +84,10 @@ class RequestMetrics:
         self.preemptions += 1
         self.mark_queued(now)
 
+    def record_speculation(self, proposed: int, accepted: int):
+        self.proposed_tokens += proposed
+        self.accepted_tokens += accepted
+
     def current_queue_time(self, now: float | None = None) -> float:
         queue_time = self.queue_time
         if self.queued_at is not None:
@@ -106,9 +112,9 @@ class RequestMetrics:
             and self.finish_time is not None
             and num_completion_tokens > 1
         ):
-            tpot = (
-                self.finish_time - self.first_token_time
-            ) / (num_completion_tokens - 1)
+            tpot = (self.finish_time - self.first_token_time) / (
+                num_completion_tokens - 1
+            )
         cache_hit_rate = (
             self.prefix_cache_hit_tokens / num_prompt_tokens
             if num_prompt_tokens
@@ -134,4 +140,11 @@ class RequestMetrics:
             "prefill_chunks": self.prefill_chunks,
             "decode_steps": self.decode_steps,
             "preemptions": self.preemptions,
+            "proposed_tokens": self.proposed_tokens,
+            "accepted_tokens": self.accepted_tokens,
+            "acceptance_rate": (
+                round(self.accepted_tokens / self.proposed_tokens, 6)
+                if self.proposed_tokens
+                else None
+            ),
         }

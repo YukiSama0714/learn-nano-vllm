@@ -1,29 +1,36 @@
 import pickle
+from multiprocessing.shared_memory import SharedMemory
+from multiprocessing.synchronize import Event
+from time import perf_counter
+
 import torch
 import torch.distributed as dist
-from multiprocessing.synchronize import Event
-from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
+from nanovllm.engine.outputs import ModelRunnerOutput, SchedulerOutput
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.utils.context import get_context, reset_context, set_context
 from nanovllm.utils.loader import load_model
 
 
 class ModelRunner:
-
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
+        self.use_cudagraph = (
+            not config.enforce_eager and config.attention_backend == "flash_attn"
+        )
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group(
+            "nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank
+        )
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
@@ -31,12 +38,28 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(
             hf_config,
             rms_norm_backend=config.rms_norm_backend,
+            attention_backend=config.attention_backend,
+            block_size=config.kvcache_block_size,
         )
         load_model(self.model, config.model)
+        self.draft_model = None
+        if config.speculative_method == "draft":
+            draft_hf_config = config.draft_hf_config
+            torch.set_default_dtype(draft_hf_config.dtype)
+            self.draft_model = Qwen3ForCausalLM(
+                draft_hf_config,
+                rms_norm_backend=config.rms_norm_backend,
+                attention_backend=config.attention_backend,
+                block_size=config.kvcache_block_size,
+            )
+            load_model(self.draft_model, config.draft_model)
+            torch.set_default_dtype(hf_config.dtype)
         self.sampler = Sampler()
         self.warmup_model()
+        if self.draft_model is not None:
+            self.warmup_draft_model()
         self.allocate_kv_cache()
-        if not self.enforce_eager:
+        if self.use_cudagraph:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -56,7 +79,7 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
+        if self.use_cudagraph:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
@@ -72,7 +95,7 @@ class ModelRunner:
         assert self.world_size > 1 and self.rank > 0
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
+        method_name, *args = pickle.loads(self.shm.buf[4 : n + 4])
         self.event.clear()
         return method_name, args
 
@@ -81,7 +104,7 @@ class ModelRunner:
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
-        self.shm.buf[4:n+4] = data
+        self.shm.buf[4 : n + 4] = data
         for event in self.event:
             event.set()
 
@@ -94,13 +117,40 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
+        max_num_batched_tokens, max_model_len = (
+            self.config.max_num_batched_tokens,
+            self.config.max_model_len,
+        )
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        self.run(SchedulerOutput.from_phase(seqs, True))
+        torch.cuda.empty_cache()
+
+    @torch.inference_mode()
+    def warmup_draft_model(self):
+        seq_len = min(
+            self.config.max_num_batched_tokens,
+            self.config.max_model_len,
+        )
+        input_ids = torch.zeros(seq_len, dtype=torch.int64)
+        positions = torch.arange(seq_len, dtype=torch.int64)
+        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32)
+        set_context(
+            True,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=seq_len,
+            max_seqlen_k=seq_len,
+            slot_mapping=torch.empty(0, dtype=torch.int32),
+            query_to_request=torch.zeros(seq_len, dtype=torch.int32),
+            query_positions=positions.to(torch.int32),
+        )
+        hidden_states = self.draft_model(input_ids, positions)
+        self.draft_model.compute_logits(hidden_states[-1:])
+        reset_context()
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -110,95 +160,296 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        block_bytes = self._model_kv_block_bytes(hf_config)
+        if config.draft_hf_config is not None:
+            block_bytes += self._model_kv_block_bytes(config.draft_hf_config)
+        available_bytes = int(total * config.gpu_memory_utilization)
+        available_bytes -= used + peak - current
+        config.num_kvcache_blocks = available_bytes // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = self._allocate_model_kv_cache(hf_config)
+        self._bind_kv_cache(self.model, self.kv_cache)
+        if self.draft_model is not None:
+            self.draft_kv_cache = self._allocate_model_kv_cache(config.draft_hf_config)
+            self._bind_kv_cache(self.draft_model, self.draft_kv_cache)
+
+    def _model_kv_geometry(self, hf_config):
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        head_dim = getattr(
+            hf_config,
+            "head_dim",
+            hf_config.hidden_size // hf_config.num_attention_heads,
+        )
+        return num_kv_heads, head_dim
+
+    def _model_kv_block_bytes(self, hf_config) -> int:
+        num_kv_heads, head_dim = self._model_kv_geometry(hf_config)
+        return (
+            2
+            * hf_config.num_hidden_layers
+            * self.block_size
+            * num_kv_heads
+            * head_dim
+            * hf_config.dtype.itemsize
+        )
+
+    def _allocate_model_kv_cache(self, hf_config):
+        num_kv_heads, head_dim = self._model_kv_geometry(hf_config)
+        return torch.empty(
+            2,
+            hf_config.num_hidden_layers,
+            self.config.num_kvcache_blocks,
+            self.block_size,
+            num_kv_heads,
+            head_dim,
+            dtype=hf_config.dtype,
+        )
+
+    @staticmethod
+    def _bind_kv_cache(model, kv_cache):
         layer_id = 0
-        for module in self.model.modules():
+        for module in model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
+                module.k_cache = kv_cache[0, layer_id]
+                module.v_cache = kv_cache[1, layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = [
+            seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs
+        ]
+        block_tables = torch.tensor(
+            block_tables, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence]):
+    def prepare_batch(self, output: SchedulerOutput):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
+        context_lens = []
         slot_mapping = []
-        block_tables = None
-        for seq in seqs:
+        logits_indices = []
+        query_to_request = []
+        query_positions = []
+        sample_requests: list[tuple[int, int]] = []
+        temperatures = []
+        seqs = output.sequences
+        has_block_tables = [bool(seq.block_table) for seq in seqs]
+        if any(has_block_tables) and not all(has_block_tables):
+            raise RuntimeError("scheduled requests must share KV allocation state")
+        block_tables = (
+            self.prepare_block_tables(seqs) if all(has_block_tables) else None
+        )
+        for request_index, request in enumerate(output.scheduled_requests):
+            seq = request.sequence
             start = seq.num_cached_tokens
-            seqlen_q = seq.num_scheduled_tokens
+            seqlen_q = request.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
-            input_ids.extend(seq[start:end])
-            positions.extend(range(start, end))
+            context_lens.append(seqlen_k)
+            request_input_ids = (
+                [seq.last_token] + request.speculative_token_ids
+                if request.speculative_token_ids
+                else seq[start:end]
+            )
+            if len(request_input_ids) != seqlen_q:
+                raise RuntimeError("scheduled query length does not match input")
+            input_ids.extend(request_input_ids)
+            request_positions = range(start, end)
+            positions.extend(request_positions)
+            query_positions.extend(request_positions)
+            query_to_request.extend([request_index] * seqlen_q)
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
-                continue
-            start_block = start // self.block_size
-            end_block = (end + self.block_size - 1) // self.block_size
-            for i in range(start_block, end_block):
-                slot_start = seq.block_table[i] * self.block_size
-                if i == start_block:
-                    slot_start += start % self.block_size
-                if i != end_block - 1:
-                    slot_end = seq.block_table[i] * self.block_size + self.block_size
-                else:
-                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
-                slot_mapping.extend(range(slot_start, slot_end))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
-        return input_ids, positions
-
-    def prepare_decode(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
-        for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-        return input_ids, positions
-
-    def prepare_sample(self, seqs: list[Sequence]):
-        temperatures = [seq.temperature for seq in seqs]
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        return temperatures
+            if request.needs_sampling:
+                num_logits = 1 + len(request.speculative_token_ids)
+                logits_start = cu_seqlens_q[-1] - num_logits
+                logits_indices.extend(range(logits_start, cu_seqlens_q[-1]))
+                sample_requests.append((request_index, num_logits))
+                temperatures.extend([seq.temperature] * num_logits)
+            if seq.block_table:
+                for token_index in range(start, end):
+                    block_index, block_offset = divmod(
+                        token_index,
+                        self.block_size,
+                    )
+                    slot_mapping.append(
+                        seq.block_table[block_index] * self.block_size + block_offset
+                    )
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
+            non_blocking=True
+        )
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(
+            non_blocking=True
+        )
+        cu_seqlens_q = torch.tensor(
+            cu_seqlens_q, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(
+            cu_seqlens_k, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(
+            slot_mapping, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        context_lens = torch.tensor(
+            context_lens,
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        logits_indices = torch.tensor(
+            logits_indices,
+            dtype=torch.int64,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        temperatures = torch.tensor(
+            temperatures,
+            dtype=torch.float32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        query_to_request = torch.tensor(
+            query_to_request,
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        query_positions = torch.tensor(
+            query_positions,
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        set_context(
+            not output.is_decode_only,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            context_lens,
+            block_tables,
+            logits_indices,
+            output.is_mixed,
+            query_to_request,
+            query_positions,
+        )
+        return (
+            input_ids,
+            positions,
+            temperatures,
+            sample_requests,
+        )
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+    def prepare_draft_speculation(self, output: SchedulerOutput):
+        for request in output.scheduled_requests:
+            if request.speculative_method != "draft":
+                continue
+            num_proposals = request.num_scheduled_tokens - 1
+            request.speculative_token_ids = self._propose_draft_tokens(
+                request.sequence,
+                num_proposals,
+            )
+
+    def _propose_draft_tokens(
+        self,
+        seq: Sequence,
+        num_proposals: int,
+    ) -> list[int]:
+        assert self.draft_model is not None
+        seq.draft_num_cached_tokens = min(
+            seq.draft_num_cached_tokens, seq.num_cached_tokens
+        )
+        start = seq.draft_num_cached_tokens
+        proposals = [self._run_draft_query(seq, seq[start:], start)]
+        seq.draft_num_cached_tokens = len(seq)
+        for _ in range(1, num_proposals):
+            start = seq.draft_num_cached_tokens
+            proposals.append(self._run_draft_query(seq, [proposals[-1]], start))
+            seq.draft_num_cached_tokens += 1
+        return proposals
+
+    def _run_draft_query(
+        self,
+        seq: Sequence,
+        input_token_ids: list[int],
+        start: int,
+    ) -> int:
+        query_length = len(input_token_ids)
+        end = start + query_length
+        input_ids = torch.tensor(
+            input_token_ids,
+            dtype=torch.int64,
+            device="cuda",
+        )
+        positions = torch.arange(
+            start,
+            end,
+            dtype=torch.int64,
+            device="cuda",
+        )
+        cu_seqlens_q = torch.tensor(
+            [0, query_length],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        cu_seqlens_k = torch.tensor(
+            [0, end],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        slot_mapping = []
+        for token_index in range(start, end):
+            block_index, block_offset = divmod(
+                token_index,
+                self.block_size,
+            )
+            slot_mapping.append(
+                seq.block_table[block_index] * self.block_size + block_offset
+            )
+        set_context(
+            True,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=query_length,
+            max_seqlen_k=end,
+            slot_mapping=torch.tensor(
+                slot_mapping,
+                dtype=torch.int32,
+                device="cuda",
+            ),
+            context_lens=torch.tensor(
+                [end],
+                dtype=torch.int32,
+                device="cuda",
+            ),
+            block_tables=self.prepare_block_tables([seq]),
+            query_to_request=torch.zeros(
+                query_length,
+                dtype=torch.int32,
+                device="cuda",
+            ),
+            query_positions=positions.to(torch.int32),
+        )
+        hidden_states = self.draft_model(input_ids, positions)
+        logits = self.draft_model.compute_logits(hidden_states[-1:])
+        token_id = logits.argmax(dim=-1).item()
+        reset_context()
+        return token_id
+
+    @torch.inference_mode()
+    def run_model(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        use_cudagraph: bool,
+    ):
+        if not use_cudagraph or not self.use_cudagraph or input_ids.size(0) > 512:
+            return self.model(input_ids, positions)
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -210,17 +461,75 @@ class ModelRunner:
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            graph_vars["block_tables"][:bs, : context.block_tables.size(1)] = (
+                context.block_tables
+            )
             graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            return graph_vars["outputs"][:bs]
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+    def run(
+        self,
+        output: SchedulerOutput | list[Sequence],
+        is_prefill: bool | None = None,
+    ) -> ModelRunnerOutput:
+        if not isinstance(output, SchedulerOutput):
+            assert is_prefill is not None
+            output = SchedulerOutput.from_phase(output, is_prefill)
+        prepare_started = perf_counter()
+        if self.draft_model is not None:
+            self.prepare_draft_speculation(output)
+        (
+            input_ids,
+            positions,
+            temperatures,
+            sample_requests,
+        ) = self.prepare_batch(output)
+        prepare_finished = perf_counter()
+        model_started = perf_counter()
+        hidden_states = self.run_model(
+            input_ids,
+            positions,
+            output.is_decode_only and output.num_proposed_tokens == 0,
+        )
+        context = get_context()
+        if sample_requests:
+            logits = self.model.compute_logits(
+                hidden_states,
+                context.logits_indices,
+            )
+        else:
+            logits = None
+        model_finished = perf_counter()
+        sampling_started = perf_counter()
+        if self.rank == 0 and logits is not None:
+            sampled = (
+                logits.argmax(dim=-1)
+                if torch.all(temperatures == 0)
+                else self.sampler(logits, temperatures)
+            )
+            sampled_token_ids = sampled.tolist()
+        else:
+            sampled_token_ids = []
+        sampling_finished = perf_counter()
+        token_ids: list[int | list[int] | None] = [None] * len(
+            output.scheduled_requests
+        )
+        sample_offset = 0
+        for request_index, num_logits in sample_requests:
+            request_token_ids = sampled_token_ids[
+                sample_offset : sample_offset + num_logits
+            ]
+            token_ids[request_index] = (
+                request_token_ids[0] if num_logits == 1 else request_token_ids
+            )
+            sample_offset += num_logits
         reset_context()
-        return token_ids
+        return ModelRunnerOutput(
+            token_ids=token_ids,
+            input_prep_seconds=prepare_finished - prepare_started,
+            model_seconds=model_finished - model_started,
+            sampling_seconds=sampling_finished - sampling_started,
+        )
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -240,21 +549,26 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            set_context(
+                False,
+                slot_mapping=slot_mapping[:bs],
+                context_lens=context_lens[:bs],
+                block_tables=block_tables[:bs],
+            )
+            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
             torch.cuda.synchronize()
             reset_context()
 
-        self.graph_vars = dict(
-            input_ids=input_ids,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            outputs=outputs,
-        )
+        self.graph_vars = {
+            "input_ids": input_ids,
+            "positions": positions,
+            "slot_mapping": slot_mapping,
+            "context_lens": context_lens,
+            "block_tables": block_tables,
+            "outputs": outputs,
+        }

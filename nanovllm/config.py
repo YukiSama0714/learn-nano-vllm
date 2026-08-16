@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+
 from transformers import AutoConfig
 
 
@@ -13,6 +14,7 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None
+    draft_hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
@@ -23,16 +25,49 @@ class Config:
     max_consecutive_decode_steps: int = 8
     scheduler_cost_ema_alpha: float = 0.2
     rms_norm_backend: str = "compiled"
+    attention_backend: str = "flash_attn"
+    speculative_method: str = "none"
+    num_speculative_tokens: int = 4
+    draft_model: str | None = None
+    ngram_min: int = 2
+    ngram_max: int = 5
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
-        assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
-        assert self.scheduling_policy in {
+        if self.scheduling_policy not in {
             "prefill_first",
             "slo_aware",
             "slo_aware_v2",
-        }
+            "slo_aware_v3",
+        }:
+            raise ValueError(f"unknown scheduling policy: {self.scheduling_policy}")
+        if self.attention_backend not in {"flash_attn", "triton_paged"}:
+            raise ValueError(f"unknown attention backend: {self.attention_backend}")
+        if self.attention_backend == "flash_attn":
+            if self.kvcache_block_size % 256:
+                raise ValueError(
+                    "flash_attn requires kvcache_block_size divisible by 256"
+                )
+        elif self.kvcache_block_size not in {16, 32, 64}:
+            raise ValueError("triton_paged requires kvcache_block_size in {16, 32, 64}")
+        if self.speculative_method not in {"none", "ngram", "draft"}:
+            raise ValueError(f"unknown speculative method: {self.speculative_method}")
+        if (
+            self.speculative_method != "none"
+            and self.scheduling_policy != "slo_aware_v3"
+        ):
+            raise ValueError(
+                "speculative decoding requires scheduling_policy='slo_aware_v3'"
+            )
+        assert self.num_speculative_tokens > 0
+        assert 1 <= self.ngram_min <= self.ngram_max
+        if self.speculative_method == "draft":
+            if self.tensor_parallel_size != 1:
+                raise ValueError("draft speculation only supports TP=1")
+            if self.draft_model is None or not os.path.isdir(self.draft_model):
+                raise ValueError("draft_model must be an existing model directory")
+            self.draft_hf_config = AutoConfig.from_pretrained(self.draft_model)
         if self.prefill_chunk_size == 0:
             self.prefill_chunk_size = self.max_num_batched_tokens
         assert 0 < self.prefill_chunk_size <= self.max_num_batched_tokens
@@ -46,3 +81,8 @@ class Config:
             self.max_model_len,
             self.hf_config.max_position_embeddings,
         )
+        if self.draft_hf_config is not None:
+            self.max_model_len = min(
+                self.max_model_len,
+                self.draft_hf_config.max_position_embeddings,
+            )
