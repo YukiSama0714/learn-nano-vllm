@@ -144,7 +144,33 @@ Qwen3-8B 的 `D=1024` 不增加 padding。
 检查，并报告小 batch（decode）和大 batch（prefill）下的耗时及有效带宽。
 只有实测后才应该修改 `num_warps`、program 粒度或向量化方式。
 
-## 8. 推荐复盘问题
+## 8. RMSNorm 与残差融合
+
+RMSNorm 对每一行最后一维计算：
+
+```text
+y = x * rsqrt(mean(x^2) + eps) * weight
+```
+
+这个算子包含 reduction，但通常更受显存读写影响。
+`Add+RMSNorm` 在同一个 kernel 中先完成 `x + residual`，同时输出
+新 residual 和归一化结果，避免中间张量在多个 kernel 之间往返显存。
+
+Qwen3 需要分开看两类形状：
+
+* `hidden_size=128`：Q/K Norm，row 数还要乘以 attention heads。
+* `hidden_size=4096`：模型主干的 input/post-attention/final Norm。
+
+Q/K 是从融合 QKV 投影结果中 `split` 出来的，最后一维连续但
+整个张量不是 contiguous。Kernel 必须使用真实 batch stride；在纯连续
+微基准上正确，不代表能直接接入模型。
+
+`benchmarks/kernels/benchmark_rmsnorm.py` 同时比较 eager PyTorch、
+`torch.compile` 和 Triton。默认仍使用原来的 `torch.compile`；只有
+Triton 在真实形状上稳定胜出，并通过端到端 A/B，才应该将它
+作为优化后端。
+
+## 9. 推荐复盘问题
 
 完成实验后，应该能独立回答：
 
@@ -156,3 +182,6 @@ Qwen3-8B 的 `D=1024` 不增加 padding。
 6. kernel 更快时，为什么端到端吞吐可能几乎不变？
 7. 为什么 decode kernel P95 下降时，用户看到的 TPOT 仍可能上升？
 8. 为什么 bulk workload 不能单独证明在线调度策略有效？
+9. Add+RMSNorm 融合节省的主要是 FLOPs 还是显存读写？
+10. 为什么 Triton RMSNorm 胜过 eager 仍不足以证明它值得替换
+    `torch.compile`？

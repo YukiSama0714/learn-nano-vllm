@@ -22,6 +22,7 @@ class Config:
     tpot_slo_ms: float = 50.0
     max_consecutive_decode_steps: int = 8
     scheduler_cost_ema_alpha: float = 0.2
+    rms_norm_backend: str = "compiled"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -39,6 +40,7 @@ class Config:
         assert self.tpot_slo_ms > 0
         assert self.max_consecutive_decode_steps > 0
         assert 0 < self.scheduler_cost_ema_alpha <= 1
+        assert self.rms_norm_backend in {"eager", "compiled", "triton"}
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(
             self.max_model_len,

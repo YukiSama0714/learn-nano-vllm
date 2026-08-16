@@ -189,7 +189,49 @@ PyTorch 后端是为 naive/optimized 对照保留的 benchmark-only 基线，
 不支持 `--shared-prefix-len` 产生的 prefix-cache 命中，也不改变推理
 引擎默认使用 Triton 的行为。
 
-## 7. 最终报告最少包含
+## 7. RMSNorm 算子实验
+
+Q/K Norm 的 `D=128` 和主干 Norm 的 `D=4096` 分开测量：
+
+```bash
+.venv/bin/python benchmarks/kernels/benchmark_rmsnorm.py \
+  --hidden-size 128 \
+  --num-rows 32 256 4096 32768 \
+  --rows-per-batch 32 \
+  --batch-padding-rows 16 \
+  --ops rms \
+  --warmup 25 \
+  --rep 100 \
+  --output runs/kernels/rmsnorm-q-d128.json
+
+.venv/bin/python benchmarks/kernels/benchmark_rmsnorm.py \
+  --hidden-size 128 \
+  --num-rows 8 64 512 4096 \
+  --rows-per-batch 8 \
+  --batch-padding-rows 40 \
+  --ops rms \
+  --warmup 25 \
+  --rep 100 \
+  --output runs/kernels/rmsnorm-k-d128.json
+
+.venv/bin/python benchmarks/kernels/benchmark_rmsnorm.py \
+  --hidden-size 4096 \
+  --num-rows 1 8 64 512 4096 \
+  --ops rms add_rms \
+  --warmup 25 \
+  --rep 100 \
+  --output runs/kernels/rmsnorm-d4096.json
+```
+
+Qwen3-8B 的融合 QKV 投影每个 token 包含 32 个 Q heads、8 个 K
+heads 和 8 个 V heads。前两条命令用 row padding 保留 `split`
+产生的真实 batch stride，避免只测连续假数据。
+
+每个 case 先与 eager 基线做正确性对比，再报告
+`Triton / eager` 和 `Triton / torch.compile` 加速比。关键判断是后者：
+原项目已经使用 `torch.compile`，因此只赢 eager 不构成替换理由。
+
+## 8. 最终报告最少包含
 
 1. 固定的软件版本、GPU、模型和 workload。
 2. 三种策略的 P50/P95 TTFT、TPOT、ITL、吞吐、违反率和显存。

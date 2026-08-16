@@ -55,6 +55,11 @@ def parse_args():
         default="triton",
     )
     parser.add_argument(
+        "--rms-norm-backend",
+        choices=("eager", "compiled", "triton"),
+        default="compiled",
+    )
+    parser.add_argument(
         "--arrival-pattern",
         choices=("bulk", "constant", "poisson"),
         default="bulk",
@@ -238,6 +243,7 @@ def main():
         tpot_slo_ms=args.tpot_slo_ms,
         max_consecutive_decode_steps=args.max_consecutive_decode_steps,
         scheduler_cost_ema_alpha=args.scheduler_cost_ema_alpha,
+        rms_norm_backend=args.rms_norm_backend,
     )
     sampling_params = SamplingParams(
         temperature=1.0,
