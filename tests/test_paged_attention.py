@@ -3,10 +3,13 @@ import unittest
 
 try:
     import torch
-
-    from nanovllm.layers.attention import paged_attention
-except (ImportError, OSError):
+except ImportError:
     torch = None
+
+CUDA_AVAILABLE = torch is not None and torch.cuda.is_available()
+if CUDA_AVAILABLE:
+    from nanovllm.layers.attention import paged_attention
+else:
     paged_attention = None
 
 
@@ -48,7 +51,7 @@ def reference_paged_attention(
 
 
 @unittest.skipUnless(
-    torch is not None and torch.cuda.is_available(),
+    CUDA_AVAILABLE,
     "CUDA is required",
 )
 class PagedAttentionTest(unittest.TestCase):
