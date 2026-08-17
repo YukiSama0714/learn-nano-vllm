@@ -17,7 +17,7 @@ class CompareGreedyOutputsTest(unittest.TestCase):
 
         self.assertEqual(
             mismatches,
-            ["repeat 0, request 0, token 1: outputs differ"],
+            ["repeat 0, request 0, token 1: expected 2, actual 9"],
         )
 
 

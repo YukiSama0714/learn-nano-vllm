@@ -43,9 +43,20 @@ def compare_token_ids(
                 ),
                 min(len(expected_tokens), len(actual_tokens)),
             )
+            expected_token = (
+                expected_tokens[mismatch_index]
+                if mismatch_index < len(expected_tokens)
+                else "<missing>"
+            )
+            actual_token = (
+                actual_tokens[mismatch_index]
+                if mismatch_index < len(actual_tokens)
+                else "<missing>"
+            )
             mismatches.append(
                 f"repeat {repeat_index}, request {request_index}, "
-                f"token {mismatch_index}: outputs differ"
+                f"token {mismatch_index}: expected {expected_token}, "
+                f"actual {actual_token}"
             )
     return mismatches
 
@@ -63,7 +74,7 @@ def main():
         load_token_ids(args.actual),
     )
     if mismatches:
-        print("FAIL: greedy token IDs differ")
+        print(f"FAIL: {len(mismatches)} request(s) have different greedy token IDs")
         for mismatch in mismatches[:20]:
             print(f"- {mismatch}")
         raise SystemExit(1)

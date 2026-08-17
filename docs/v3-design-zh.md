@@ -92,7 +92,7 @@ NANOVLLM_RUN_EXTENDED_KERNEL_TESTS=1 \
 128/512/2048/4096，Qwen3 GQA 32Q/8KV、D=128，BF16 容差
 `atol=rtol=2e-2`。
 
-## 4. 冻结 greedy 金标
+## 4. 冻结 greedy reference 并校验自复现
 
 以下命令保存固定 100 条请求的 token IDs。模型路径按服务器实际位置修改。
 
@@ -115,8 +115,16 @@ mkdir -p "$RUN_ROOT/golden"
   --output "$RUN_ROOT/golden/v2-flash.json"
 ```
 
-每个结果的 `runs[].output_token_ids` 是金标；`environment` 同时保存 Git
-commit、GPU、Torch/CUDA/Triton/FlashAttention 和模型结构摘要。
+每个结果的 `runs[].output_token_ids` 是 reference trace；`environment` 同时保存
+Git commit、GPU、Torch/CUDA/Triton/FlashAttention 和模型结构摘要。必须先用
+完全相同的命令重跑一次并与 reference 比较，不能默认在线实验逐 token 可复现。
+
+Poisson 到达和基于实测耗时的 SLO 调度可能在两次运行中形成不同 batch shape。
+FlashAttention、GEMM 和 BF16 归约对相同数学问题也不保证跨 shape 位级一致；低
+logit margin 时，微小误差可能翻转 greedy argmax。如果 baseline 与自身重跑都不
+一致，严格 token equality 只能作为诊断信号，不能单独判定 mixed batch 错误。
+此时正确性门槛是：调度状态单测、Attention 对 FP32 reference 的容差比较、固定
+输入的 committed KV/token 不变量，以及 baseline 自身不稳定率的原样报告。
 
 ## 5. 阶段 1：v3 mixed batch A/B
 
