@@ -103,6 +103,9 @@ class SchedulerOutput:
 @dataclass(slots=True)
 class ModelRunnerOutput:
     token_ids: list[int | list[int] | None]
+    token_diagnostics: list[list[dict[str, object]] | None] = field(
+        default_factory=list
+    )
     input_prep_seconds: float = 0.0
     model_seconds: float = 0.0
     sampling_seconds: float = 0.0

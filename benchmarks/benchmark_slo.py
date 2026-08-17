@@ -77,6 +77,7 @@ def parse_args():
     parser.add_argument("--ngram-min", type=int, default=2)
     parser.add_argument("--ngram-max", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--record-token-diagnostics", action="store_true")
     parser.add_argument(
         "--kv-store-backend",
         choices=("triton", "pytorch"),
@@ -372,6 +373,7 @@ def main():
         num_speculative_tokens=args.num_speculative_tokens,
         ngram_min=args.ngram_min,
         ngram_max=args.ngram_max,
+        record_token_diagnostics=args.record_token_diagnostics,
     )
     sampling_params = SamplingParams(
         temperature=args.temperature,
@@ -420,43 +422,47 @@ def main():
         step_metrics = llm.take_step_metrics()
         all_step_metrics.extend(step_metrics)
 
+        token_diagnostics = [
+            output["metrics"].pop("token_diagnostics", []) for output in outputs
+        ]
         metrics = [output["metrics"] for output in outputs]
         request_metrics.extend(metrics)
         output_tokens = sum(len(output["token_ids"]) for output in outputs)
-        runs.append(
-            {
-                "repeat": repeat,
-                "elapsed_ms": round(elapsed * 1000, 3),
-                "requests_per_second": round(args.num_requests / elapsed, 3),
-                "output_tokens_per_second": round(output_tokens / elapsed, 3),
-                "arrival_span_ms": round(arrival_offsets[-1] * 1000, 3),
-                "estimated_prefill_ms_per_token": round(
-                    (llm.scheduler.prefill_seconds_per_token or 0.0) * 1000,
-                    6,
-                ),
-                "estimated_decode_step_ms": round(
-                    (llm.scheduler.decode_step_seconds or 0.0) * 1000,
-                    3,
-                ),
-                "peak_allocated_gib": round(
-                    torch.cuda.max_memory_allocated() / 1024**3,
-                    3,
-                ),
-                "peak_reserved_gib": round(
-                    torch.cuda.max_memory_reserved() / 1024**3,
-                    3,
-                ),
-                "steps": summarize_step_metrics(step_metrics),
-                "output_token_ids": [output["token_ids"] for output in outputs],
-            }
-        )
+        run = {
+            "repeat": repeat,
+            "elapsed_ms": round(elapsed * 1000, 3),
+            "requests_per_second": round(args.num_requests / elapsed, 3),
+            "output_tokens_per_second": round(output_tokens / elapsed, 3),
+            "arrival_span_ms": round(arrival_offsets[-1] * 1000, 3),
+            "estimated_prefill_ms_per_token": round(
+                (llm.scheduler.prefill_seconds_per_token or 0.0) * 1000,
+                6,
+            ),
+            "estimated_decode_step_ms": round(
+                (llm.scheduler.decode_step_seconds or 0.0) * 1000,
+                3,
+            ),
+            "peak_allocated_gib": round(
+                torch.cuda.max_memory_allocated() / 1024**3,
+                3,
+            ),
+            "peak_reserved_gib": round(
+                torch.cuda.max_memory_reserved() / 1024**3,
+                3,
+            ),
+            "steps": summarize_step_metrics(step_metrics),
+            "output_token_ids": [output["token_ids"] for output in outputs],
+        }
+        if args.record_token_diagnostics:
+            run["output_token_diagnostics"] = token_diagnostics
+        runs.append(run)
 
     total_prompt_tokens = sum(metric["prompt_tokens"] for metric in request_metrics)
     total_cache_hit_tokens = sum(
         metric["prefix_cache_hit_tokens"] for metric in request_metrics
     )
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "environment": {
             "torch": torch.__version__,
             "cuda": torch.version.cuda,

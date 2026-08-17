@@ -501,6 +501,7 @@ class ModelRunner:
             logits = None
         model_finished = perf_counter()
         sampling_started = perf_counter()
+        diagnostic_rows: list[dict[str, object]] = []
         if self.rank == 0 and logits is not None:
             sampled = (
                 logits.argmax(dim=-1)
@@ -508,10 +509,30 @@ class ModelRunner:
                 else self.sampler(logits, temperatures)
             )
             sampled_token_ids = sampled.tolist()
+            if self.config.record_token_diagnostics:
+                top_logits, top_token_ids = torch.topk(
+                    logits.float(),
+                    k=2,
+                    dim=-1,
+                )
+                diagnostic_rows = [
+                    {
+                        "top_token_ids": token_ids,
+                        "top_logits": values,
+                        "margin": values[0] - values[1],
+                    }
+                    for token_ids, values in zip(
+                        top_token_ids.tolist(),
+                        top_logits.tolist(),
+                    )
+                ]
         else:
             sampled_token_ids = []
         sampling_finished = perf_counter()
         token_ids: list[int | list[int] | None] = [None] * len(
+            output.scheduled_requests
+        )
+        token_diagnostics: list[list[dict[str, object]] | None] = [None] * len(
             output.scheduled_requests
         )
         sample_offset = 0
@@ -522,10 +543,29 @@ class ModelRunner:
             token_ids[request_index] = (
                 request_token_ids[0] if num_logits == 1 else request_token_ids
             )
+            if diagnostic_rows:
+                request = output.scheduled_requests[request_index]
+                request_diagnostics = diagnostic_rows[
+                    sample_offset : sample_offset + num_logits
+                ]
+                for diagnostic in request_diagnostics:
+                    diagnostic.update(
+                        {
+                            "mixed_step": output.is_mixed,
+                            "is_prefill": request.is_prefill,
+                            "query_length": request.num_scheduled_tokens,
+                            "context_length": (
+                                request.sequence.num_cached_tokens
+                                + request.num_scheduled_tokens
+                            ),
+                        }
+                    )
+                token_diagnostics[request_index] = request_diagnostics
             sample_offset += num_logits
         reset_context()
         return ModelRunnerOutput(
             token_ids=token_ids,
+            token_diagnostics=token_diagnostics,
             input_prep_seconds=prepare_finished - prepare_started,
             model_seconds=model_finished - model_started,
             sampling_seconds=sampling_finished - sampling_started,

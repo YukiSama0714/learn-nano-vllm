@@ -126,6 +126,12 @@ logit margin 时，微小误差可能翻转 greedy argmax。如果 baseline 与�
 此时正确性门槛是：调度状态单测、Attention 对 FP32 reference 的容差比较、固定
 输入的 committed KV/token 不变量，以及 baseline 自身不稳定率的原样报告。
 
+需要解释首个 token 分叉时，在 reference 和 candidate 命令中同时加入
+`--record-token-diagnostics`。该选项为每个采样位置保存 top-2 token、logits、
+margin、是否 mixed、query/context 长度。`compare_greedy_outputs.py` 会在首个
+分叉处打印两边信息。诊断会增加 top-k 和 CPU 同步开销，因此这些运行不能用于
+报告吞吐或延迟。
+
 ## 5. 阶段 1：v3 mixed batch A/B
 
 先只改 scheduler，不改 attention 和 speculation：

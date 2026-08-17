@@ -37,6 +37,7 @@ class RequestMetrics:
     proposed_tokens: int = 0
     accepted_tokens: int = 0
     inter_token_gaps: list[float] = field(default_factory=list)
+    token_diagnostics: list[dict[str, object]] = field(default_factory=list)
 
     def __post_init__(self):
         self.queued_at = self.arrival_time
@@ -88,6 +89,9 @@ class RequestMetrics:
         self.proposed_tokens += proposed
         self.accepted_tokens += accepted
 
+    def record_token_diagnostics(self, diagnostics: list[dict[str, object]]):
+        self.token_diagnostics.extend(diagnostics)
+
     def current_queue_time(self, now: float | None = None) -> float:
         queue_time = self.queue_time
         if self.queued_at is not None:
@@ -99,7 +103,7 @@ class RequestMetrics:
         self,
         num_prompt_tokens: int,
         num_completion_tokens: int,
-    ) -> dict[str, float | int | None]:
+    ) -> dict[str, object]:
         ttft = None
         e2e = None
         tpot = None
@@ -124,7 +128,7 @@ class RequestMetrics:
         max_inter_token_gap = (
             max(self.inter_token_gaps) if self.inter_token_gaps else None
         )
-        return {
+        result: dict[str, object] = {
             "prompt_tokens": num_prompt_tokens,
             "completion_tokens": num_completion_tokens,
             "ttft_ms": _milliseconds(ttft),
@@ -148,3 +152,6 @@ class RequestMetrics:
                 else None
             ),
         }
+        if self.token_diagnostics:
+            result["token_diagnostics"] = self.token_diagnostics.copy()
+        return result

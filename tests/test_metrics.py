@@ -4,7 +4,6 @@ from nanovllm.engine.metrics import RequestMetrics
 
 
 class RequestMetricsTest(unittest.TestCase):
-
     def test_request_lifecycle_metrics(self):
         metrics = RequestMetrics(arrival_time=10.0)
         metrics.mark_scheduled(is_prefill=True, now=11.0)
@@ -61,6 +60,19 @@ class RequestMetricsTest(unittest.TestCase):
         self.assertEqual(result["tpot_ms"], 2000.0)
         self.assertEqual(result["inter_token_gap_p95_ms"], 2900.0)
         self.assertEqual(result["max_inter_token_gap_ms"], 3000.0)
+
+    def test_token_diagnostics_are_preserved_for_benchmark_output(self):
+        metrics = RequestMetrics(arrival_time=0.0)
+        diagnostic = {
+            "top_token_ids": [4, 7],
+            "top_logits": [2.0, 1.5],
+            "margin": 0.5,
+        }
+
+        metrics.record_token_diagnostics([diagnostic])
+        result = metrics.to_dict(4, 1)
+
+        self.assertEqual(result["token_diagnostics"], [diagnostic])
 
 
 if __name__ == "__main__":

@@ -66,6 +66,13 @@ class LLMEngine:
         started_at = perf_counter()
         model_output = self.model_runner.call("run", scheduler_output)
         finished_at = perf_counter()
+        if model_output.token_diagnostics:
+            for request, diagnostics in zip(
+                scheduler_output.scheduled_requests,
+                model_output.token_diagnostics,
+            ):
+                if diagnostics:
+                    request.sequence.metrics.record_token_diagnostics(diagnostics)
         self.scheduler.postprocess(
             scheduler_output,
             model_output.token_ids,

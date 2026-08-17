@@ -31,6 +31,7 @@ class Config:
     draft_model: str | None = None
     ngram_min: int = 2
     ngram_max: int = 5
+    record_token_diagnostics: bool = False
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
