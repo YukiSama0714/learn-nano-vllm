@@ -194,9 +194,17 @@ attention kernel 本身，因此冲刷时间不会计入结果。设置为 0 可
 microbenchmark，但不能把它外推到在线推理：模型的相邻层访问不同 KV cache，
 而不是重复读取同一层、同一批请求的 KV 数据。
 
-端到端 A/B 只改 backend 和 block size。第一轮两边都加
-`--enforce-eager`，隔离 kernel；第二轮再将 FlashAttention 的 CUDA Graph
-作为生产基线比较。
+当前 cold-cache 数据仍显示 split-K kernel 获益，但 eager E2E 回退。为区分
+GPU 执行时间和逐层 host launch 成本，`triton_paged` 的 pure decode 也接入
+CUDA Graph：capture metadata 额外保存静态 `query_to_request`，replay 前更新
+`query_positions`、block table、slot mapping 和 context length。mixed/prefill
+仍走 eager varlen 路径。graph bucket 在 capture 时固定 kernel 路线，因此
+`auto` graph 应作为独立候选与 `general` graph 比较，不能和 eager 数据混用。
+
+端到端 A/B 只改 backend、block size 和明确记录的 decode kernel。第一轮两边
+都加 `--enforce-eager`，观察未捕获时的 kernel 与 launch 总成本；第二轮去掉
+该参数，让 FlashAttention 和 Triton PagedAttention 都进入 CUDA Graph，作为
+更接近生产路径的比较。
 
 两边必须固定 `--prefill-chunk-granularity 256`。KV page size 是内存管理参数，
 不能隐式改变 scheduler 的最小 chunk，否则比较同时混入了 kernel 与调度策略
@@ -216,6 +224,18 @@ split-K 的端到端归因需要再跑一条只改 decode kernel 的回退基线
 ```bash
 --attention-backend triton_paged --kvcache-block-size 32 \
 --paged-attention-decode-kernel general --enforce-eager
+```
+
+CUDA Graph A/B 则同时去掉 `--enforce-eager`：
+
+```bash
+# graph reference
+--attention-backend triton_paged --kvcache-block-size 32 \
+--paged-attention-decode-kernel general
+
+# graph candidate
+--attention-backend triton_paged --kvcache-block-size 32 \
+--paged-attention-decode-kernel auto
 ```
 
 shared-prefix=240 的专项实验：

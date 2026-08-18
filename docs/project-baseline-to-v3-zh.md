@@ -683,9 +683,12 @@ buffer，避免逐 step 重复分配；`auto` 只在 context 超过 512 token �
 program 少于 1024 时启用。microbenchmark JSON 还记录 `resolved_kernel` 和
 `speedup_vs_general`，便于判断 auto 路由及收益。
 
-5090 的热缓存 microbenchmark 一度显示 batch=8、context=2048/4096 分别加速
-1.52 倍和 2.13 倍，但它连续 100 次读取同一份 KV cache，测得 3.5--4.2 TB/s
-的有效带宽，主要反映 L2 命中而非在线工作集。端到端 A/B 否定了该结论：
+5090 的热缓存 microbenchmark 显示 batch=8、context=2048/4096 分别加速
+1.52 倍和 2.13 倍。加入 256MiB cache flush 后仍有 1.90 倍和 1.99 倍，说明
+split-K 的 GPU kernel 并行化确实有效，而不只是重复读取同一 KV cache 导致的
+L2 假象。这里的 3TB/s 以上是按每个 Q head 重复读取 KV 计算的“有效带宽”；
+GQA 的四个 Q head 会在同一次 launch 中通过 cache 复用同一个 KV head，不能把
+它当成物理 HBM 带宽。尽管 kernel micro 获益，eager 端到端 A/B 仍然回退：
 
 | 指标 | page32 general | page32 split-K auto | 变化 |
 |---|---:|---:|---:|
@@ -697,14 +700,17 @@ program 少于 1024 时启用。microbenchmark JSON 还记录 `resolved_kernel` 
 
 两边 mixed-step rate 都约为 12%，Chunks P95 都是 5，说明回退不是调度差异。
 split-K 运行中 pure-decode 平均为 28.053ms；其中 batch=8 占 pure-decode
-step 的 89.0%，平均为 28.071ms。额外的第二个 kernel、FP32 partial buffer
-写回/读取和跨 36 层启动开销抵消了热缓存 micro 收益，随后又因吞吐低于约
-256 output tok/s 的 offered load 放大 queue、TTFT 和 E2E。
+step 的 89.0%，平均为 28.071ms。该 A/B 使用 `--enforce-eager`，split-K 将
+每层一次 attention launch 变成 partial/reduce 两次，36 层的 Python/Triton
+启动开销会逐 token 累积；micro 的 CUDA event 只测设备执行，不包含这部分 host
+launch 成本。吞吐低于约 256 output tok/s 的 offered load 后，又进一步放大
+queue、TTFT 和 E2E。
 
 因此 `general` 恢复为 PagedAttention decode 的安全默认值，split-K 保留为
 opt-in 失败实验。microbenchmark 默认在每次计时前冲刷 256MiB cache buffer；
-只有冷缓存 micro 与端到端都获益时，才允许重新推荐 split-K。下一条 kernel
-路线是融合一个 GQA group 的共享 KV traversal。
+下一步先把 `triton_paged` pure decode 接入 CUDA Graph，捕获 36 层的
+partial/reduce launch，再做 graph-general/graph-auto A/B。只有 graph E2E 也
+获益时才允许重新推荐 split-K；若仍回退，再进入 GQA group KV 共享 traversal。
 
 ## 8. 第六层改造：Greedy 无损推测解码
 

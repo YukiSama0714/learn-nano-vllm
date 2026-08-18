@@ -21,9 +21,7 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.use_cudagraph = (
-            not config.enforce_eager and config.attention_backend == "flash_attn"
-        )
+        self.use_cudagraph = not config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -455,7 +453,8 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph_bs = next(x for x in self.graph_bs if x >= bs)
+            graph = self.graphs[graph_bs]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -466,6 +465,9 @@ class ModelRunner:
             graph_vars["block_tables"][:bs, : context.block_tables.size(1)] = (
                 context.block_tables
             )
+            if self.config.attention_backend == "triton_paged":
+                graph_vars["query_positions"][:graph_bs].zero_()
+                graph_vars["query_positions"][:bs] = context.query_positions
             graph.replay()
             return graph_vars["outputs"][:bs]
 
@@ -584,8 +586,13 @@ class ModelRunner:
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        query_to_request = torch.arange(max_bs, dtype=torch.int32)
+        query_positions = torch.zeros(max_bs, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [size for size in (1, 2, 4, 8) if size <= max_bs]
+        self.graph_bs.extend(range(16, max_bs + 1, 16))
+        if not self.graph_bs or self.graph_bs[-1] != max_bs:
+            self.graph_bs.append(max_bs)
         self.graphs = {}
         self.graph_pool = None
 
@@ -596,6 +603,8 @@ class ModelRunner:
                 slot_mapping=slot_mapping[:bs],
                 context_lens=context_lens[:bs],
                 block_tables=block_tables[:bs],
+                query_to_request=query_to_request[:bs],
+                query_positions=query_positions[:bs],
             )
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
             with torch.cuda.graph(graph, self.graph_pool):
@@ -612,5 +621,7 @@ class ModelRunner:
             "slot_mapping": slot_mapping,
             "context_lens": context_lens,
             "block_tables": block_tables,
+            "query_to_request": query_to_request,
+            "query_positions": query_positions,
             "outputs": outputs,
         }
