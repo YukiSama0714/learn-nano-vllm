@@ -40,6 +40,7 @@ class ModelRunner:
             rms_norm_backend=config.rms_norm_backend,
             attention_backend=config.attention_backend,
             block_size=config.kvcache_block_size,
+            paged_attention_decode_kernel=config.paged_attention_decode_kernel,
         )
         load_model(self.model, config.model)
         self.draft_model = None
@@ -51,6 +52,7 @@ class ModelRunner:
                 rms_norm_backend=config.rms_norm_backend,
                 attention_backend=config.attention_backend,
                 block_size=config.kvcache_block_size,
+                paged_attention_decode_kernel=config.paged_attention_decode_kernel,
             )
             load_model(self.draft_model, config.draft_model)
             torch.set_default_dtype(hf_config.dtype)

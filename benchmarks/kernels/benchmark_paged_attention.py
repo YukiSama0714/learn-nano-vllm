@@ -5,7 +5,12 @@ from pathlib import Path
 
 import torch
 
-from nanovllm.layers.attention import paged_attention
+from nanovllm.layers.attention import (
+    PAGED_ATTENTION_PARTITION_SIZE,
+    allocate_splitk_workspace,
+    paged_attention,
+    resolve_paged_attention_decode_kernel,
+)
 
 
 def pytorch_reference(
@@ -72,6 +77,12 @@ def parse_args():
     parser.add_argument("--num-query-heads", type=int, default=32)
     parser.add_argument("--num-kv-heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument(
+        "--decode-kernels",
+        nargs="+",
+        choices=("general", "split_k", "auto"),
+        default=("general", "split_k"),
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--seed", type=int, default=2026)
@@ -127,18 +138,6 @@ def main():
                     dtype=torch.int32,
                 )
 
-                run_triton = partial(
-                    paged_attention,
-                    query,
-                    key_cache,
-                    value_cache,
-                    block_tables,
-                    query_to_request,
-                    query_positions,
-                    scale,
-                    page_size,
-                )
-
                 expected = pytorch_reference(
                     query,
                     key_cache,
@@ -147,15 +146,6 @@ def main():
                     context_length,
                     scale,
                 )
-                actual = run_triton()
-                max_error = (actual - expected).abs().max().item()
-                torch.testing.assert_close(
-                    actual,
-                    expected,
-                    rtol=2e-2,
-                    atol=2e-2,
-                )
-                triton_ms = benchmark(run_triton, args.warmup, args.repeats)
                 logical_bytes = (
                     2
                     * batch_size
@@ -164,21 +154,63 @@ def main():
                     * args.head_dim
                     * query.element_size()
                 )
-                rows.append(
-                    {
-                        "page_size": page_size,
-                        "batch_size": batch_size,
-                        "context_length": context_length,
-                        "triton_ms": round(triton_ms, 6),
-                        "effective_gb_per_second": round(
-                            logical_bytes / triton_ms / 1e6,
-                            3,
-                        ),
-                        "max_error": max_error,
-                    }
+                num_partitions = (
+                    context_length + PAGED_ATTENTION_PARTITION_SIZE - 1
+                ) // PAGED_ATTENTION_PARTITION_SIZE
+                workspace = allocate_splitk_workspace(
+                    query,
+                    num_partitions,
                 )
+                for decode_kernel in args.decode_kernels:
+                    resolved_kernel = resolve_paged_attention_decode_kernel(
+                        decode_kernel,
+                        batch_size,
+                        args.num_query_heads,
+                        num_partitions,
+                    )
+                    run_triton = partial(
+                        paged_attention,
+                        query,
+                        key_cache,
+                        value_cache,
+                        block_tables,
+                        query_to_request,
+                        query_positions,
+                        scale,
+                        page_size,
+                        decode_kernel,
+                        workspace,
+                    )
+                    actual = run_triton()
+                    max_error = (actual - expected).abs().max().item()
+                    torch.testing.assert_close(
+                        actual,
+                        expected,
+                        rtol=2e-2,
+                        atol=2e-2,
+                    )
+                    triton_ms = benchmark(
+                        run_triton,
+                        args.warmup,
+                        args.repeats,
+                    )
+                    rows.append(
+                        {
+                            "decode_kernel": decode_kernel,
+                            "resolved_kernel": resolved_kernel,
+                            "page_size": page_size,
+                            "batch_size": batch_size,
+                            "context_length": context_length,
+                            "triton_ms": round(triton_ms, 6),
+                            "effective_gb_per_second": round(
+                                logical_bytes / triton_ms / 1e6,
+                                3,
+                            ),
+                            "max_error": max_error,
+                        }
+                    )
+                    del run_triton, actual
                 del (
-                    run_triton,
                     query,
                     key_cache,
                     value_cache,
@@ -186,8 +218,22 @@ def main():
                     query_to_request,
                     query_positions,
                     expected,
-                    actual,
+                    workspace,
                 )
+    general_ms = {
+        (row["page_size"], row["batch_size"], row["context_length"]): row["triton_ms"]
+        for row in rows
+        if row["decode_kernel"] == "general"
+    }
+    for row in rows:
+        baseline_ms = general_ms.get(
+            (row["page_size"], row["batch_size"], row["context_length"])
+        )
+        row["speedup_vs_general"] = (
+            round(baseline_ms / row["triton_ms"], 3)
+            if baseline_ms is not None
+            else None
+        )
     result = {
         "schema_version": 1,
         "config": vars(args) | {"output": str(args.output) if args.output else None},

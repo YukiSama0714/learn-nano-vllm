@@ -36,6 +36,9 @@ token IDs，不能把 hash 相等直接当成内容相等。
 5. 用 FP32 online softmax 累积，最后转回 BF16。
 
 当前支持 16、32、64-token page。FlashAttention 仍是默认后端和 reference。
+pure decode 还可选择 `general`、`split_k` 或 `auto` kernel。split-K 以
+512-token partition 并行生成 FP32 partial max/sum/accumulator，再由第二个
+kernel 完成全局 softmax 归约；mixed/prefill 始终保留原 general kernel。
 
 ### 1.3 speculative 的“提交长度”不等于“验证长度”
 
@@ -171,8 +174,17 @@ queue、preemption 和 starvation。Poisson 8/12/16 req/s 只改
   --page-sizes 16 32 64 \
   --batch-sizes 1 8 32 128 \
   --context-lengths 128 512 2048 4096 \
+  --decode-kernels general split_k auto \
   --output "$RUN_ROOT/paged-attention-kernel.json"
 ```
+
+`general` 是单程序遍历完整 context 的原始实现；`split_k` 强制两阶段归约；
+`auto` 仅在 context 超过一个 512-token partition，且
+`batch * query_heads < 1024` 时选择 split-K。正确性通过后，先比较 batch 1/8
+的 2048/4096 context；batch 32/128 用于确认 auto 不会因额外归约明显回退。
+每条 microbenchmark 结果同时记录请求的 `decode_kernel`、`auto` 实际解析出的
+`resolved_kernel`，以及相对同形状 `general` 的 `speedup_vs_general`，避免只看
+`auto` 标签却不知道真正执行了哪条路径。
 
 端到端 A/B 只改 backend 和 block size。第一轮两边都加
 `--enforce-eager`，隔离 kernel；第二轮再将 FlashAttention 的 CUDA Graph
@@ -187,7 +199,15 @@ queue、preemption 和 starvation。Poisson 8/12/16 req/s 只改
 --attention-backend flash_attn --kvcache-block-size 256 --enforce-eager
 
 # candidate
---attention-backend triton_paged --kvcache-block-size 16 --enforce-eager
+--attention-backend triton_paged --kvcache-block-size 32 \
+--paged-attention-decode-kernel auto --enforce-eager
+```
+
+split-K 的端到端归因需要再跑一条只改 decode kernel 的回退基线：
+
+```bash
+--attention-backend triton_paged --kvcache-block-size 32 \
+--paged-attention-decode-kernel general --enforce-eager
 ```
 
 shared-prefix=240 的专项实验：

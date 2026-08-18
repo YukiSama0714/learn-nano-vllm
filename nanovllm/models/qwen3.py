@@ -32,6 +32,7 @@ class Qwen3Attention(nn.Module):
         rms_norm_backend: str = "compiled",
         attention_backend: str = "flash_attn",
         block_size: int = 256,
+        paged_attention_decode_kernel: str = "auto",
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -74,6 +75,7 @@ class Qwen3Attention(nn.Module):
             self.num_kv_heads,
             backend=attention_backend,
             block_size=block_size,
+            paged_attention_decode_kernel=paged_attention_decode_kernel,
         )
         if not self.qkv_bias:
             self.q_norm = RMSNorm(
@@ -141,6 +143,7 @@ class Qwen3DecoderLayer(nn.Module):
         rms_norm_backend: str = "compiled",
         attention_backend: str = "flash_attn",
         block_size: int = 256,
+        paged_attention_decode_kernel: str = "auto",
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
@@ -156,6 +159,7 @@ class Qwen3DecoderLayer(nn.Module):
             rms_norm_backend=rms_norm_backend,
             attention_backend=attention_backend,
             block_size=block_size,
+            paged_attention_decode_kernel=paged_attention_decode_kernel,
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
@@ -196,6 +200,7 @@ class Qwen3Model(nn.Module):
         rms_norm_backend: str = "compiled",
         attention_backend: str = "flash_attn",
         block_size: int = 256,
+        paged_attention_decode_kernel: str = "auto",
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
@@ -208,6 +213,7 @@ class Qwen3Model(nn.Module):
                     rms_norm_backend,
                     attention_backend,
                     block_size,
+                    paged_attention_decode_kernel,
                 )
                 for _ in range(config.num_hidden_layers)
             ]
@@ -246,6 +252,7 @@ class Qwen3ForCausalLM(nn.Module):
         rms_norm_backend: str = "compiled",
         attention_backend: str = "flash_attn",
         block_size: int = 256,
+        paged_attention_decode_kernel: str = "auto",
     ) -> None:
         super().__init__()
         self.model = Qwen3Model(
@@ -253,6 +260,7 @@ class Qwen3ForCausalLM(nn.Module):
             rms_norm_backend,
             attention_backend,
             block_size,
+            paged_attention_decode_kernel,
         )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:

@@ -41,6 +41,7 @@ PagedAttention 端到端吞吐只有 FlashAttention 的 84.1%，仍属于待优�
 | Triton KV-store | 是 | micro + E2E A/B | TPOT 改善约 1.52% |
 | Triton RMSNorm | 是 | micro + E2E A/B | 未优于 compiled，默认关闭 |
 | Triton PagedAttention 16/32/64 | 是 | GPU matrix 通过 | page32 只有 Flash 的 84.1% |
+| split-K PagedAttention decode | 是 | 本地静态检查；5090 待验 | 尚无端到端数据 |
 | n-gram speculative decoding | 是 | 接受/拒绝/回滚测试 | 完整 5090 A/B 待完成 |
 | Qwen3-0.6B draft decoding | 是 | 单元测试与显存规划路径 | TP=1 MVP，性能待验收 |
 
@@ -674,11 +675,15 @@ Poisson 2 req/s、每请求 128 输出 token 的 offered output load 约为
 因此此时 TTFT 主要表示队列不稳定，不能直接当作单次 attention latency。
 
 不再继续测试 page64：已有 microbenchmark 显示它与 page32 基本相同，却会
-增加尾块浪费。下一步按既定设计加入 split-K decode：把长 context 划分为多个
+增加尾块浪费。当前已按既定设计加入 split-K decode：把长 context 划分为多个
 partition，第一阶段分别计算 FP32 partial max/sum/accumulator，第二阶段归并。
 这会把 batch≤8 时的并行 program 数从 `batch * query_heads` 扩大到
-`batch * query_heads * partitions`。split-K 若仍不足，再融合一个 GQA group
-的共享 KV traversal；不能继续靠调 SLO 参数掩盖 kernel service rate 不足。
+`batch * query_heads * partitions`。每层使用 grow-only workspace 缓存 partial
+buffer，避免逐 step 重复分配；`auto` 只在 context 超过 512 token 且基础
+program 少于 1024 时启用。microbenchmark JSON 还记录 `resolved_kernel` 和
+`speedup_vs_general`，便于判断 auto 路由及收益。该路径仍需 5090
+correctness/micro/E2E 验证；若 split-K 仍不足，再融合一个 GQA group 的共享
+KV traversal。
 
 ## 8. 第六层改造：Greedy 无损推测解码
 
@@ -1123,8 +1128,8 @@ git log --oneline origin/main..HEAD
 
 推荐后续顺序：
 
-1. 实现 split-K decode，并在 page32 上进行 general/split-K micro A/B；
-2. 若仍不达标，融合一个 GQA group 的共享 KV traversal；
+1. 在 5090 上完成 split-K correctness 和 page32 general/split-K micro A/B；
+2. 运行 split-K page32 端到端 A/B；若仍不达标再融合 GQA KV traversal；
 3. 用 bulk A/B 验证峰值服务能力，再为 Triton decode 接入 CUDA Graph；
 4. 完成 n-gram 与 0.6B draft 的 acceptance/TPOT/显存验收；
 5. 加入 CPU/GPU async overlap；

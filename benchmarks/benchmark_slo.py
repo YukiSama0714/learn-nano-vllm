@@ -67,6 +67,11 @@ def parse_args():
         choices=("flash_attn", "triton_paged"),
         default="flash_attn",
     )
+    parser.add_argument(
+        "--paged-attention-decode-kernel",
+        choices=("general", "split_k", "auto"),
+        default="auto",
+    )
     parser.add_argument("--kvcache-block-size", type=int, default=256)
     parser.add_argument(
         "--speculative-method",
@@ -376,6 +381,7 @@ def main():
         scheduler_cost_ema_alpha=args.scheduler_cost_ema_alpha,
         rms_norm_backend=args.rms_norm_backend,
         attention_backend=args.attention_backend,
+        paged_attention_decode_kernel=args.paged_attention_decode_kernel,
         kvcache_block_size=args.kvcache_block_size,
         speculative_method=args.speculative_method,
         draft_model=args.draft_model,

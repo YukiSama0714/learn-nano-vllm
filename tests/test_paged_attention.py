@@ -58,7 +58,13 @@ def reference_paged_attention(
     "CUDA is required",
 )
 class PagedAttentionTest(unittest.TestCase):
-    def run_case(self, page_size, batch_size, context_length):
+    def run_case(
+        self,
+        page_size,
+        batch_size,
+        context_length,
+        decode_kernel="general",
+    ):
         torch.manual_seed(0)
         num_query_heads = 32
         num_kv_heads = 8
@@ -108,6 +114,7 @@ class PagedAttentionTest(unittest.TestCase):
             query_positions,
             scale,
             page_size,
+            decode_kernel=decode_kernel,
         )
         expected = reference_paged_attention(
             query,
@@ -183,6 +190,20 @@ class PagedAttentionTest(unittest.TestCase):
             scale,
         )
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    def test_splitk_gqa_across_partition_boundaries(self):
+        for page_size in (16, 32, 64):
+            for context_length in (513, 2051):
+                with self.subTest(
+                    page_size=page_size,
+                    context_length=context_length,
+                ):
+                    self.run_case(
+                        page_size,
+                        batch_size=8,
+                        context_length=context_length,
+                        decode_kernel="split_k",
+                    )
 
     def test_flash_backend_mixed_varlen_matches_reference(self):
         torch.manual_seed(0)
@@ -338,16 +359,19 @@ class PagedAttentionTest(unittest.TestCase):
         for page_size in (16, 32, 64):
             for batch_size in (1, 8, 32, 128):
                 for context_length in (128, 512, 2048, 4096):
-                    with self.subTest(
-                        page_size=page_size,
-                        batch_size=batch_size,
-                        context_length=context_length,
-                    ):
-                        self.run_case(
-                            page_size,
-                            batch_size,
-                            context_length,
-                        )
+                    for decode_kernel in ("general", "split_k"):
+                        with self.subTest(
+                            page_size=page_size,
+                            batch_size=batch_size,
+                            context_length=context_length,
+                            decode_kernel=decode_kernel,
+                        ):
+                            self.run_case(
+                                page_size,
+                                batch_size,
+                                context_length,
+                                decode_kernel,
+                            )
 
 
 if __name__ == "__main__":

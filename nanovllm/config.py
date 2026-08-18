@@ -27,6 +27,7 @@ class Config:
     scheduler_cost_ema_alpha: float = 0.2
     rms_norm_backend: str = "compiled"
     attention_backend: str = "flash_attn"
+    paged_attention_decode_kernel: str = "auto"
     speculative_method: str = "none"
     num_speculative_tokens: int = 4
     draft_model: str | None = None
@@ -46,6 +47,14 @@ class Config:
             raise ValueError(f"unknown scheduling policy: {self.scheduling_policy}")
         if self.attention_backend not in {"flash_attn", "triton_paged"}:
             raise ValueError(f"unknown attention backend: {self.attention_backend}")
+        if self.paged_attention_decode_kernel not in {
+            "general",
+            "split_k",
+            "auto",
+        }:
+            raise ValueError(
+                "paged_attention_decode_kernel must be general, split_k, or auto"
+            )
         if self.attention_backend == "flash_attn":
             if self.kvcache_block_size % 256:
                 raise ValueError(

@@ -56,6 +56,7 @@ def main():
         "KV store",
         "RMSNorm",
         "Attention",
+        "PA decode",
         "Block",
         "Speculation",
         "Mixed steps",
@@ -84,6 +85,7 @@ def main():
         result = json.loads(path.read_text(encoding="utf-8"))
         config = result["config"]
         summary = result["summary"]
+        attention_backend = config.get("attention_backend", "flash_attn")
         ttft_violation_rate = summary.get("ttft_slo_violation_rate")
         itl_violation_rate = summary.get("inter_token_slo_violation_rate")
         if args.eval_ttft_slo_ms is not None:
@@ -103,7 +105,12 @@ def main():
             config["scheduling_policy"],
             config.get("kv_store_backend", "triton"),
             config.get("rms_norm_backend", "compiled"),
-            config.get("attention_backend", "flash_attn"),
+            attention_backend,
+            (
+                config.get("paged_attention_decode_kernel", "auto")
+                if attention_backend == "triton_paged"
+                else "-"
+            ),
             str(config.get("kvcache_block_size", 256)),
             config.get("speculative_method", "none"),
             format_rate(summary.get("steps", {}).get("mixed_step_rate")),
