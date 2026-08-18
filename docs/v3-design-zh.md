@@ -39,6 +39,8 @@ token IDs，不能把 hash 相等直接当成内容相等。
 pure decode 还可选择 `general`、`split_k` 或 `auto` kernel。split-K 以
 512-token partition 并行生成 FP32 partial max/sum/accumulator，再由第二个
 kernel 完成全局 softmax 归约；mixed/prefill 始终保留原 general kernel。
+由于 5090 端到端验证出现负收益，PagedAttention decode 的安全默认值是
+`general`，`split_k` 和 `auto` 仅用于显式实验。
 
 ### 1.3 speculative 的“提交长度”不等于“验证长度”
 
@@ -175,6 +177,7 @@ queue、preemption 和 starvation。Poisson 8/12/16 req/s 只改
   --batch-sizes 1 8 32 128 \
   --context-lengths 128 512 2048 4096 \
   --decode-kernels general split_k auto \
+  --flush-cache-mib 256 \
   --output "$RUN_ROOT/paged-attention-kernel.json"
 ```
 
@@ -185,6 +188,11 @@ queue、preemption 和 starvation。Poisson 8/12/16 req/s 只改
 每条 microbenchmark 结果同时记录请求的 `decode_kernel`、`auto` 实际解析出的
 `resolved_kernel`，以及相对同形状 `general` 的 `speedup_vs_general`，避免只看
 `auto` 标签却不知道真正执行了哪条路径。
+
+`--flush-cache-mib 256` 会在每次计时前写入独立 buffer，但 CUDA event 只包围
+attention kernel 本身，因此冲刷时间不会计入结果。设置为 0 可以复现热缓存
+microbenchmark，但不能把它外推到在线推理：模型的相邻层访问不同 KV cache，
+而不是重复读取同一层、同一批请求的 KV 数据。
 
 端到端 A/B 只改 backend 和 block size。第一轮两边都加
 `--enforce-eager`，隔离 kernel；第二轮再将 FlashAttention 的 CUDA Graph

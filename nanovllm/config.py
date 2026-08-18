@@ -27,7 +27,7 @@ class Config:
     scheduler_cost_ema_alpha: float = 0.2
     rms_norm_backend: str = "compiled"
     attention_backend: str = "flash_attn"
-    paged_attention_decode_kernel: str = "auto"
+    paged_attention_decode_kernel: str = "general"
     speculative_method: str = "none"
     num_speculative_tokens: int = 4
     draft_model: str | None = None

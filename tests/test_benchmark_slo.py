@@ -1,10 +1,13 @@
 import random
+import sys
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from benchmarks.benchmark_slo import (
     make_arrival_offsets,
+    parse_args,
     pytorch_store_kvcache,
     run_workload,
     violation_rate,
@@ -12,7 +15,6 @@ from benchmarks.benchmark_slo import (
 
 
 class FakeClock:
-
     def __init__(self):
         self.now = 0.0
 
@@ -24,13 +26,11 @@ class FakeClock:
 
 
 class FakeTokenizer:
-
     def decode(self, token_ids):
         return " ".join(str(token_id) for token_id in token_ids)
 
 
 class FakeLlm:
-
     def __init__(self, clock):
         self.clock = clock
         self.tokenizer = FakeTokenizer()
@@ -58,6 +58,15 @@ class FakeLlm:
 
 
 class BenchmarkSloTest(unittest.TestCase):
+    def test_paged_attention_decode_defaults_to_general(self):
+        with patch.object(
+            sys,
+            "argv",
+            ["benchmark_slo.py", "--model", "/unused/model"],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.paged_attention_decode_kernel, "general")
 
     def test_pytorch_kv_store_writes_selected_slots(self):
         key = torch.arange(12).reshape(2, 2, 3)

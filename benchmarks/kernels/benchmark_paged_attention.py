@@ -48,18 +48,24 @@ def pytorch_reference(
     return torch.stack(outputs).to(query.dtype)
 
 
-def benchmark(function, warmup, repeats):
+def benchmark(function, warmup, repeats, cache_flush=None):
     for _ in range(warmup):
+        if cache_flush is not None:
+            cache_flush.add_(1)
         function()
     torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
+    events = []
     for _ in range(repeats):
+        if cache_flush is not None:
+            cache_flush.add_(1)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
         function()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / repeats
+        end.record()
+        events.append((start, end))
+    events[-1][1].synchronize()
+    return sum(start.elapsed_time(end) for start, end in events) / repeats
 
 
 def parse_args():
@@ -85,6 +91,12 @@ def parse_args():
     )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=50)
+    parser.add_argument(
+        "--flush-cache-mib",
+        type=int,
+        default=256,
+        help="MiB written before each timed kernel; use 0 for a hot-cache benchmark.",
+    )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -92,6 +104,10 @@ def parse_args():
         parser.error("page sizes must be 16, 32, or 64")
     if args.num_query_heads % args.num_kv_heads:
         parser.error("query heads must be divisible by KV heads")
+    if args.warmup < 0 or args.repeats <= 0:
+        parser.error("warmup must be non-negative and repeats must be positive")
+    if args.flush_cache_mib < 0:
+        parser.error("--flush-cache-mib must be non-negative")
     return args
 
 
@@ -100,6 +116,15 @@ def main():
     torch.manual_seed(args.seed)
     rows = []
     scale = args.head_dim**-0.5
+    cache_flush = (
+        torch.zeros(
+            args.flush_cache_mib * 1024 * 1024,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        if args.flush_cache_mib
+        else None
+    )
     for page_size in args.page_sizes:
         for batch_size in args.batch_sizes:
             for context_length in args.context_lengths:
@@ -193,6 +218,7 @@ def main():
                         run_triton,
                         args.warmup,
                         args.repeats,
+                        cache_flush,
                     )
                     rows.append(
                         {
@@ -235,7 +261,7 @@ def main():
             else None
         )
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "config": vars(args) | {"output": str(args.output) if args.output else None},
         "environment": {
             "torch": torch.__version__,

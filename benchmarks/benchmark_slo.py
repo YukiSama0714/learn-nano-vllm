@@ -70,7 +70,7 @@ def parse_args():
     parser.add_argument(
         "--paged-attention-decode-kernel",
         choices=("general", "split_k", "auto"),
-        default="auto",
+        default="general",
     )
     parser.add_argument("--kvcache-block-size", type=int, default=256)
     parser.add_argument(

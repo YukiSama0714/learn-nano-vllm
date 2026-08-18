@@ -41,7 +41,7 @@ PagedAttention 端到端吞吐只有 FlashAttention 的 84.1%，仍属于待优�
 | Triton KV-store | 是 | micro + E2E A/B | TPOT 改善约 1.52% |
 | Triton RMSNorm | 是 | micro + E2E A/B | 未优于 compiled，默认关闭 |
 | Triton PagedAttention 16/32/64 | 是 | GPU matrix 通过 | page32 只有 Flash 的 84.1% |
-| split-K PagedAttention decode | 是 | 本地静态检查；5090 待验 | 尚无端到端数据 |
+| split-K PagedAttention decode | 是，实验性 | correctness + hot micro + E2E | E2E 吞吐下降 8.4%，默认关闭 |
 | n-gram speculative decoding | 是 | 接受/拒绝/回滚测试 | 完整 5090 A/B 待完成 |
 | Qwen3-0.6B draft decoding | 是 | 单元测试与显存规划路径 | TP=1 MVP，性能待验收 |
 
@@ -681,9 +681,30 @@ partition，第一阶段分别计算 FP32 partial max/sum/accumulator，第二�
 `batch * query_heads * partitions`。每层使用 grow-only workspace 缓存 partial
 buffer，避免逐 step 重复分配；`auto` 只在 context 超过 512 token 且基础
 program 少于 1024 时启用。microbenchmark JSON 还记录 `resolved_kernel` 和
-`speedup_vs_general`，便于判断 auto 路由及收益。该路径仍需 5090
-correctness/micro/E2E 验证；若 split-K 仍不足，再融合一个 GQA group 的共享
-KV traversal。
+`speedup_vs_general`，便于判断 auto 路由及收益。
+
+5090 的热缓存 microbenchmark 一度显示 batch=8、context=2048/4096 分别加速
+1.52 倍和 2.13 倍，但它连续 100 次读取同一份 KV cache，测得 3.5--4.2 TB/s
+的有效带宽，主要反映 L2 命中而非在线工作集。端到端 A/B 否定了该结论：
+
+| 指标 | page32 general | page32 split-K auto | 变化 |
+|---|---:|---:|---:|
+| Output tok/s | 221.81 | 203.20 | -8.4% |
+| TPOT P95 | 38.06ms | 41.38ms | +8.7% |
+| TTFT P95 | 12477.93ms | 16814.19ms | +34.8% |
+| E2E P95 | 16205.63ms | 21050.43ms | +29.9% |
+| Peak GiB | 27.54 | 27.66 | +0.12GiB |
+
+两边 mixed-step rate 都约为 12%，Chunks P95 都是 5，说明回退不是调度差异。
+split-K 运行中 pure-decode 平均为 28.053ms；其中 batch=8 占 pure-decode
+step 的 89.0%，平均为 28.071ms。额外的第二个 kernel、FP32 partial buffer
+写回/读取和跨 36 层启动开销抵消了热缓存 micro 收益，随后又因吞吐低于约
+256 output tok/s 的 offered load 放大 queue、TTFT 和 E2E。
+
+因此 `general` 恢复为 PagedAttention decode 的安全默认值，split-K 保留为
+opt-in 失败实验。microbenchmark 默认在每次计时前冲刷 256MiB cache buffer；
+只有冷缓存 micro 与端到端都获益时，才允许重新推荐 split-K。下一条 kernel
+路线是融合一个 GQA group 的共享 KV traversal。
 
 ## 8. 第六层改造：Greedy 无损推测解码
 

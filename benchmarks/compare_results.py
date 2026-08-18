@@ -107,7 +107,7 @@ def main():
             config.get("rms_norm_backend", "compiled"),
             attention_backend,
             (
-                config.get("paged_attention_decode_kernel", "auto")
+                config.get("paged_attention_decode_kernel", "general")
                 if attention_backend == "triton_paged"
                 else "-"
             ),

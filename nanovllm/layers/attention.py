@@ -684,7 +684,7 @@ class Attention(nn.Module):
         num_kv_heads: int,
         backend: str = "flash_attn",
         block_size: int = 256,
-        paged_attention_decode_kernel: str = "auto",
+        paged_attention_decode_kernel: str = "general",
     ):
         super().__init__()
         self.num_heads = num_heads
