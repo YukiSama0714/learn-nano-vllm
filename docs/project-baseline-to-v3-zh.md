@@ -25,8 +25,8 @@
 最成熟的产出是 `slo_aware_v2`：在 Qwen3-8B、RTX 5090 的 held-out
 320 请求实验中，将 Max ITL P95 从 259.21ms 降到 68.23ms，吞吐仅下降
 0.16%。v3 的 mixed batch、细粒度 Triton PagedAttention 和 greedy
-speculative decoding 已完成主要实现与正确性测试，但 page16 PagedAttention
-目前端到端吞吐只有 FlashAttention 的 83.2%，仍属于待优化能力。
+speculative decoding 已完成主要实现与正确性测试，但当前最佳的 page32
+PagedAttention 端到端吞吐只有 FlashAttention 的 84.1%，仍属于待优化能力。
 
 ### 0.1 当前能力状态
 
@@ -40,7 +40,7 @@ speculative decoding 已完成主要实现与正确性测试，但 page16 PagedA
 | O(1) BlockPool、LRU、truncate | 是 | 单元测试 | 细 page E2E 仍在验收 |
 | Triton KV-store | 是 | micro + E2E A/B | TPOT 改善约 1.52% |
 | Triton RMSNorm | 是 | micro + E2E A/B | 未优于 compiled，默认关闭 |
-| Triton PagedAttention 16/32/64 | 是 | GPU matrix 通过 | page16 只有 Flash 的 83.2% |
+| Triton PagedAttention 16/32/64 | 是 | GPU matrix 通过 | page32 只有 Flash 的 84.1% |
 | n-gram speculative decoding | 是 | 接受/拒绝/回滚测试 | 完整 5090 A/B 待完成 |
 | Qwen3-0.6B draft decoding | 是 | 单元测试与显存规划路径 | TP=1 MVP，性能待验收 |
 
@@ -433,8 +433,9 @@ FlashAttention + pure decode + no speculative proposals
 ```
 
 mixed batch、Triton PagedAttention 和 speculative verify 首版走 eager。
-这是当前 page16 端到端落后的一个系统级因素，不能只看 attention kernel
-微基准。
+不过当前 Flash/page16/page32 A/B 都显式使用了 `--enforce-eager`，所以 CUDA
+Graph 不解释这组实验中的差距。它是未来把 Triton backend 接入默认在线路径时
+仍需解决的系统问题，不能与本轮 eager kernel 差距混为一谈。
 
 ## 6. 第四层改造：BlockPool、prefix cache 与回滚
 
@@ -630,20 +631,28 @@ GPU 测试覆盖：
 
 Qwen3-8B、mixed input 128/512/2048、Poisson 2 req/s：
 
-| 指标 | Flash block256 | Triton page16 |
-|---|---:|---:|
-| Mixed steps | 8.0% | 12.3% |
-| TTFT P95 | 5428.97ms | 12481.60ms |
-| Queue P95 | 5360.43ms | 12271.46ms |
-| TPOT P95 | 27.92ms | 38.19ms |
-| Output tok/s | 267.24 | 222.37 |
-| Peak GiB | 27.52 | 27.54 |
+| 指标 | Flash block256 | Triton page16 | Triton page32 |
+|---|---:|---:|---:|
+| Mixed steps | 8.0% | 12.3% | 12.3% |
+| TTFT P95 | 5428.97ms | 12481.60ms | 11998.74ms |
+| Queue P95 | 5360.43ms | 12271.46ms | 11826.53ms |
+| TPOT P95 | 27.92ms | 38.19ms | 37.89ms |
+| Max ITL P95 | 126.93ms | 542.31ms | 537.99ms |
+| E2E P95 | 8935.55ms | 16226.45ms | 15699.97ms |
+| Output tok/s | 267.24 | 222.37 | 224.66 |
+| Peak GiB | 27.52 | 27.54 | 27.54 |
 
-page16 只有 Flash 吞吐的：
+page16 和 page32 分别只有 Flash 吞吐的：
 
 ```text
 222.37 / 267.24 = 83.2%
+224.66 / 267.24 = 84.1%
 ```
+
+page32 相对 page16 只提高 1.0% output tok/s；TTFT、queue 和 E2E 分别改善
+3.9%、3.6% 和 3.2%，但两者的 mixed rate 与 Chunks P95 完全相同。说明
+page-size lookup 有影响，却不是足以关闭性能差距的主杠杆，也证明调度粒度
+解耦后没有隐藏地改变 chunk 行为。
 
 phase 分解显示：
 
@@ -655,18 +664,21 @@ pure decode model step： 24.040ms vs Flash 21.784ms
 
 因此当前根因不是 prefill，而是 decode 单步慢约 10.4%，再叠加：
 
-- Triton backend 没有 decode CUDA Graph；
 - GQA KV 读取没有按 group 复用；
-- page16 增加 block-table lookup；
+- max batch 只有 8，长 context 的单程序遍历没有充分占满 5090；
+- 细 page 增加 block-table lookup；
 - 服务能力低于 offered load 后，queue 形成非线性放大。
 
 Poisson 2 req/s、每请求 128 输出 token 的 offered output load 约为
-`256 tok/s`。Flash 只有少量余量，而 page16 的 `222 tok/s` 已低于输入负载，
+`256 tok/s`。Flash 只有少量余量，而 page16/page32 都低于输入负载，
 因此此时 TTFT 主要表示队列不稳定，不能直接当作单次 attention latency。
 
-下一步优先验证 page32；微基准中它在 batch≤8、长 context 下比 page16 快约
-16%～30%，同时相对 block256 仍能把平均尾块容量降低约 8 倍。若仍不达标，
-应优化 GQA KV reuse，而不是继续盲调 SLO 参数。
+不再继续测试 page64：已有 microbenchmark 显示它与 page32 基本相同，却会
+增加尾块浪费。下一步按既定设计加入 split-K decode：把长 context 划分为多个
+partition，第一阶段分别计算 FP32 partial max/sum/accumulator，第二阶段归并。
+这会把 batch≤8 时的并行 program 数从 `batch * query_heads` 扩大到
+`batch * query_heads * partitions`。split-K 若仍不足，再融合一个 GQA group
+的共享 KV traversal；不能继续靠调 SLO 参数掩盖 kernel service rate 不足。
 
 ## 8. 第六层改造：Greedy 无损推测解码
 
@@ -932,8 +944,8 @@ FlashAttention、CUDA Graph 和 chunked prefill，我主要补齐了请求级指
 259ms 降到 68ms，吞吐下降 0.16%，但 E2E P95 增加 8%，我把这个权衡完整
 保留下来。之后我进一步把调度接口重构为 per-request token budget，实现
 mixed prefill/decode、细粒度 Triton PagedAttention 和 greedy speculative
-decoding。PagedAttention 正确性已通过，但 page16 端到端只有 Flash 的
-83.2%，目前在定位 decode GQA 复用和 CUDA Graph 差距。
+decoding。PagedAttention 正确性已通过，但当前最佳 page32 端到端只有 Flash
+的 84.1%，目前在沿 split-K occupancy 和 GQA KV 复用继续优化 decode。
 
 ### 13.2 推荐的 15 分钟展开顺序
 
@@ -946,7 +958,7 @@ decoding。PagedAttention 正确性已通过，但 page16 端到端只有 Flash 
 7. 画 mixed batch 的 `cu_seqlens/logits_indices/block_tables`；
 8. 讲 online softmax 和 GQA head mapping；
 9. 用 KV-store 正例和 RMSNorm/PagedAttention 负例讲 Amdahl 定律；
-10. 主动说明单卡、无 HTTP、page16 未达标等边界。
+10. 主动说明单卡、无 HTTP、page16/page32 未达标等边界。
 
 ### 13.3 可使用的简历 bullet
 
@@ -960,9 +972,9 @@ decoding。PagedAttention 正确性已通过，但 page16 端到端只有 Flash 
   混合 decode 与多个 partial prefill，并保持旧策略和 CLI 兼容。
 
 - 实现支持 GQA、16/32/64-token page 和 FP32 online softmax 的 Triton
-  PagedAttention，构建 batch/context/page GPU correctness matrix；识别 page16
-  在在线负载中仅达到 Flash 83.2% 吞吐，并通过 step breakdown 定位 decode
-  kernel、GQA KV reuse 和 eager launch 路径。
+  PagedAttention，构建 batch/context/page GPU correctness matrix；识别当前
+  最佳 page32 在在线负载中仅达到 Flash 84.1% 吞吐，并通过 step breakdown
+  将瓶颈收敛到小 batch 长 context occupancy 与 GQA KV reuse。
 
 - 构建支持 bulk/constant/Poisson arrivals 的版本化 benchmark，采集 TTFT、
   TPOT、Max ITL、KV fragmentation、prefix hit 与阶段耗时，并以固定验收阈值、
@@ -1103,7 +1115,7 @@ git log --oneline origin/main..HEAD
 - Tensor Parallel 是上游能力，本项目没有形成多卡通信优化结果；
 - benchmark 不包含 HTTP server、tokenization 和网络排队；
 - v2 的固定长度 held-out 证据强于 v3 mixed-length 证据；
-- page16 PagedAttention 正确但端到端未达 95% 目标；
+- page16/page32 PagedAttention 正确但端到端未达 95% 目标；
 - speculative decoding 尚无完整 acceptance/TPOT 结果；
 - 动态 BF16 batching 不保证跨 batch shape bit-exact token IDs。
 - kernel 模块目前 eager import Triton；未安装 Triton 的 CPU-only 开发机无法
@@ -1111,9 +1123,9 @@ git log --oneline origin/main..HEAD
 
 推荐后续顺序：
 
-1. page32 Poisson 与 bulk A/B，分开验证 SLO 和服务能力；
+1. 实现 split-K decode，并在 page32 上进行 general/split-K micro A/B；
 2. 若仍不达标，融合一个 GQA group 的共享 KV traversal；
-3. 为纯 decode Triton backend 设计 CUDA Graph 或 persistent batch；
+3. 用 bulk A/B 验证峰值服务能力，再为 Triton decode 接入 CUDA Graph；
 4. 完成 n-gram 与 0.6B draft 的 acceptance/TPOT/显存验收；
 5. 加入 CPU/GPU async overlap；
 6. 再考虑 FP8 KV、fused sampler、HTTP 服务与 Prometheus；
