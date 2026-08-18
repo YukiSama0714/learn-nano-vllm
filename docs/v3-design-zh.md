@@ -193,6 +193,9 @@ shared-prefix=240 的专项实验：
 
 block16 应产生 committed full-block cache hit；block256 的首块混入随机后缀，
 命中率应为 0。与此同时比较 `kv_tail_waste_tokens`，不能只报告理论 16 倍。
+`kv_tail_waste_tokens` 只计算最后一个物理 page 未被逻辑 token 或 speculative
+lookahead 使用的槽位；尚未计算但已经为 prompt 保留的 token 单独记录为
+`kv_uncomputed_tokens`，不能误算成尾块浪费。
 
 ## 7. 阶段 3：greedy speculative A/B
 

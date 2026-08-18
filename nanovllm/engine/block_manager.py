@@ -242,7 +242,18 @@ class BlockManager:
         computed_tokens = sum(
             min(seq.num_cached_tokens, len(seq)) for seq in unique_sequences
         )
-        tail_waste = max(0, allocated_tokens - computed_tokens)
+        reserved_tokens = sum(
+            min(
+                len(seq.block_table) * self.block_size,
+                max(
+                    len(seq),
+                    seq.num_cached_tokens + seq.num_scheduled_tokens,
+                ),
+            )
+            for seq in unique_sequences
+        )
+        uncomputed_tokens = max(0, reserved_tokens - computed_tokens)
+        tail_waste = max(0, allocated_tokens - reserved_tokens)
         utilization = (
             len(self.used_block_ids) / len(self.blocks) if self.blocks else 0.0
         )
@@ -250,7 +261,9 @@ class BlockManager:
             "kv_used_blocks": len(self.used_block_ids),
             "kv_free_blocks": len(self.free_block_ids),
             "kv_allocated_tokens": allocated_tokens,
+            "kv_reserved_tokens": reserved_tokens,
             "kv_computed_tokens": computed_tokens,
+            "kv_uncomputed_tokens": uncomputed_tokens,
             "kv_tail_waste_tokens": tail_waste,
             "kv_block_utilization": round(utilization, 6),
         }

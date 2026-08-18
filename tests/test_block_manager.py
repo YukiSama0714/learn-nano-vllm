@@ -103,6 +103,36 @@ class BlockManagerTest(unittest.TestCase):
 
         self.assertGreaterEqual(wastes[256] / wastes[16], 8)
 
+    def test_uncomputed_prompt_capacity_is_not_tail_waste(self):
+        Sequence.block_size = 256
+        manager = BlockManager(num_blocks=8, block_size=256)
+        sequence = Sequence(list(range(1024)))
+        manager.allocate(sequence, num_cached_blocks=0)
+        sequence.num_cached_tokens = 256
+
+        stats = manager.stats([sequence])
+
+        self.assertEqual(stats["kv_allocated_tokens"], 1024)
+        self.assertEqual(stats["kv_reserved_tokens"], 1024)
+        self.assertEqual(stats["kv_computed_tokens"], 256)
+        self.assertEqual(stats["kv_uncomputed_tokens"], 768)
+        self.assertEqual(stats["kv_tail_waste_tokens"], 0)
+
+    def test_speculative_lookahead_is_reserved_not_tail_waste(self):
+        manager = BlockManager(num_blocks=4, block_size=4)
+        sequence = Sequence(list(range(5)))
+        manager.allocate(sequence, num_cached_blocks=0)
+        sequence.num_cached_tokens = 4
+        sequence.num_scheduled_tokens = 6
+        manager.reserve(sequence, total_tokens=10)
+
+        stats = manager.stats([sequence])
+
+        self.assertEqual(stats["kv_allocated_tokens"], 12)
+        self.assertEqual(stats["kv_reserved_tokens"], 10)
+        self.assertEqual(stats["kv_uncomputed_tokens"], 6)
+        self.assertEqual(stats["kv_tail_waste_tokens"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

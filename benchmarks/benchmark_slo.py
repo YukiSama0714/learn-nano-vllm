@@ -280,6 +280,10 @@ def summarize_step_metrics(step_metrics):
         "sampling_ms",
         "prefill_tokens",
         "decode_tokens",
+        "kv_allocated_tokens",
+        "kv_reserved_tokens",
+        "kv_computed_tokens",
+        "kv_uncomputed_tokens",
         "kv_tail_waste_tokens",
         "kv_block_utilization",
     ):
