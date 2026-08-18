@@ -20,6 +20,7 @@ class Config:
     num_kvcache_blocks: int = -1
     scheduling_policy: str = "prefill_first"
     prefill_chunk_size: int = 0
+    prefill_chunk_granularity: int = 0
     ttft_slo_ms: float = 500.0
     tpot_slo_ms: float = 50.0
     max_consecutive_decode_steps: int = 8
@@ -71,7 +72,10 @@ class Config:
             self.draft_hf_config = AutoConfig.from_pretrained(self.draft_model)
         if self.prefill_chunk_size == 0:
             self.prefill_chunk_size = self.max_num_batched_tokens
+        if self.prefill_chunk_granularity == 0:
+            self.prefill_chunk_granularity = min(256, self.prefill_chunk_size)
         assert 0 < self.prefill_chunk_size <= self.max_num_batched_tokens
+        assert 0 < self.prefill_chunk_granularity <= self.prefill_chunk_size
         assert self.ttft_slo_ms >= 0
         assert self.tpot_slo_ms > 0
         assert self.max_consecutive_decode_steps > 0

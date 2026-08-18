@@ -57,6 +57,7 @@ def parse_args():
         default="prefill_first",
     )
     parser.add_argument("--prefill-chunk-size", type=int, default=0)
+    parser.add_argument("--prefill-chunk-granularity", type=int, default=0)
     parser.add_argument("--ttft-slo-ms", type=float, default=500.0)
     parser.add_argument("--tpot-slo-ms", type=float, default=50.0)
     parser.add_argument("--max-consecutive-decode-steps", type=int, default=8)
@@ -110,6 +111,9 @@ def parse_args():
         parser.error("request and repeat counts must be positive")
     if not 0 <= args.prefill_chunk_size <= args.max_num_batched_tokens:
         parser.error("--prefill-chunk-size must not exceed --max-num-batched-tokens")
+    resolved_chunk_size = args.prefill_chunk_size or args.max_num_batched_tokens
+    if not 0 <= args.prefill_chunk_granularity <= resolved_chunk_size:
+        parser.error("--prefill-chunk-granularity must not exceed the chunk size")
     if (
         args.ttft_slo_ms < 0
         or args.tpot_slo_ms <= 0
@@ -365,6 +369,7 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         scheduling_policy=args.scheduling_policy,
         prefill_chunk_size=prefill_chunk_size,
+        prefill_chunk_granularity=args.prefill_chunk_granularity,
         ttft_slo_ms=args.ttft_slo_ms,
         tpot_slo_ms=args.tpot_slo_ms,
         max_consecutive_decode_steps=args.max_consecutive_decode_steps,
@@ -482,6 +487,7 @@ def main():
         | {
             "output": str(args.output) if args.output else None,
             "prefill_chunk_size": prefill_chunk_size,
+            "prefill_chunk_granularity": llm.config.prefill_chunk_granularity,
         },
         "summary": {
             "elapsed_ms": summarize([run["elapsed_ms"] for run in runs]),

@@ -49,7 +49,9 @@ estimate = alpha * sample + (1 - alpha) * estimate
 safe_tokens = positive_decode_slack / prefill_seconds_per_token
 ```
 
-再按 block size 向下对齐，并限制在 `[one block, prefill_chunk_size]`。
+v2 再按 KV block size 向下对齐。v3 使用独立的
+`prefill_chunk_granularity`，避免 page16 与 block256 在相同 workload 下产生
+不同的调度粒度；它限制在 `[one granularity, prefill_chunk_size]`。
 
 ## 手算练习
 
@@ -90,4 +92,3 @@ partial prefill 限制与 round-robin 如何改变理论决策。
 - 哪个条件会让“更紧的 TPOT target”反而恶化真实延迟。
 
 完成后进入 [模块 checkpoint](99-checkpoint.md)。
-

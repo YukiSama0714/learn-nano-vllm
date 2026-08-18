@@ -16,18 +16,21 @@ def make_config(
     cost_ema_alpha=0.2,
     speculative_method="none",
     num_speculative_tokens=4,
+    chunk_granularity=4,
+    block_size=4,
 ):
     return SimpleNamespace(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=8,
         prefill_chunk_size=chunk_size,
+        prefill_chunk_granularity=min(chunk_granularity, chunk_size),
         scheduling_policy=policy,
         ttft_slo_ms=ttft_slo_ms,
         tpot_slo_ms=tpot_slo_ms,
         max_consecutive_decode_steps=2,
         scheduler_cost_ema_alpha=cost_ema_alpha,
         eos=-1,
-        kvcache_block_size=4,
+        kvcache_block_size=block_size,
         num_kvcache_blocks=32,
         speculative_method=speculative_method,
         num_speculative_tokens=num_speculative_tokens,
@@ -334,6 +337,34 @@ class SchedulerTest(unittest.TestCase):
         )
 
         self.assertEqual(prefill_request.num_scheduled_tokens, 4)
+
+    def test_v3_chunk_granularity_is_independent_of_kv_page_size(self):
+        scheduled_tokens = []
+        for block_size in (2, 4):
+            Sequence.block_size = block_size
+            scheduler = Scheduler(
+                make_config(
+                    policy="slo_aware_v3",
+                    chunk_size=8,
+                    chunk_granularity=4,
+                    block_size=block_size,
+                    max_num_seqs=2,
+                    tpot_slo_ms=10,
+                )
+            )
+            running = self.add_running_sequence(scheduler)
+            running.metrics.mark_token(1, perf_counter())
+            scheduler.add(Sequence(list(range(12)), self.sampling_params))
+            scheduler.prefill_seconds_per_token = 0.002
+            scheduler.decode_step_seconds = 0.002
+
+            output = scheduler.schedule()
+            prefill_request = next(
+                request for request in output.scheduled_requests if request.is_prefill
+            )
+            scheduled_tokens.append(prefill_request.num_scheduled_tokens)
+
+        self.assertEqual(scheduled_tokens, [4, 4])
 
     def test_v3_allows_multiple_partial_prefills(self):
         scheduler = Scheduler(

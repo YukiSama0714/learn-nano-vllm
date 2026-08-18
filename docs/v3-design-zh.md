@@ -150,6 +150,7 @@ for POLICY in slo_aware_v2 slo_aware_v3; do
     --request-rate 2 \
     --scheduling-policy "$POLICY" \
     --prefill-chunk-size 1024 \
+    --prefill-chunk-granularity 256 \
     --ttft-slo-ms 500 \
     --tpot-slo-ms 75 \
     --temperature 0 \
@@ -176,6 +177,10 @@ queue、preemption 和 starvation。Poisson 8/12/16 req/s 只改
 端到端 A/B 只改 backend 和 block size。第一轮两边都加
 `--enforce-eager`，隔离 kernel；第二轮再将 FlashAttention 的 CUDA Graph
 作为生产基线比较。
+
+两边必须固定 `--prefill-chunk-granularity 256`。KV page size 是内存管理参数，
+不能隐式改变 scheduler 的最小 chunk，否则比较同时混入了 kernel 与调度策略
+两项变量。
 
 ```bash
 # reference

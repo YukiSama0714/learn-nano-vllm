@@ -16,6 +16,11 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.prefill_chunk_size = config.prefill_chunk_size
+        self.prefill_chunk_granularity = getattr(
+            config,
+            "prefill_chunk_granularity",
+            min(256, self.prefill_chunk_size),
+        )
         self.scheduling_policy = config.scheduling_policy
         self.ttft_slo_ms = config.ttft_slo_ms
         self.tpot_slo_ms = config.tpot_slo_ms
@@ -283,7 +288,11 @@ class Scheduler:
     ) -> int:
         remaining_tokens = self._remaining_prefill_tokens(seq)
         chunk = min(remaining_tokens, token_budget, self.prefill_chunk_size)
-        minimum = min(self.block_size, remaining_tokens, token_budget)
+        minimum = min(
+            self.prefill_chunk_granularity,
+            remaining_tokens,
+            token_budget,
+        )
         if chunk <= 0 or chunk == remaining_tokens:
             return chunk
         if self.prefill_seconds_per_token is not None and decode_slacks:
@@ -296,7 +305,9 @@ class Scheduler:
             safe_tokens = int(available / self.prefill_seconds_per_token)
             chunk = min(chunk, max(minimum, safe_tokens))
         if chunk < remaining_tokens:
-            aligned = chunk // self.block_size * self.block_size
+            aligned = (
+                chunk // self.prefill_chunk_granularity * self.prefill_chunk_granularity
+            )
             chunk = max(minimum, aligned)
         return min(chunk, remaining_tokens, token_budget)
 
