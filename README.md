@@ -162,6 +162,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 - [`docs/learning-guide-zh.md`](docs/learning-guide-zh.md)
 - [`docs/slo-v2-results-zh.md`](docs/slo-v2-results-zh.md)
 - [`docs/interview-guide-zh.md`](docs/interview-guide-zh.md)
+- [`docs/project-baseline-to-v3-zh.md`](docs/project-baseline-to-v3-zh.md)
 - [`docs/v3-design-zh.md`](docs/v3-design-zh.md)
 - [`docs/course/00-syllabus.md`](docs/course/00-syllabus.md)
 
