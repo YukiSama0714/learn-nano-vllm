@@ -517,7 +517,8 @@ batch=8、page32：
 | 2048 | 1.525x | 1.904x |
 | 4096 | 2.133x | 1.993x |
 
-冷缓存结果证明设备端并行化收益真实存在。但 eager E2E：
+冷缓存结果显示收益不是仅在热缓存条件下出现，支持 split-K 设备端并行化有效的
+解释；但没有 Nsight 计数器，不能据此完成单一因果证明。eager E2E：
 
 | 指标 | page32 general | page32 auto split-K |
 |---|---:|---:|
@@ -677,14 +678,16 @@ PagedAttention GQA/mixed smoke；split-K micro 每个 case 内置 reference asse
    TPOT、32GB 和 10% 目标缺失。
 4. **旧策略兼容证明不完整**：有适配接口和单测，没有完整 trace/CLI snapshot。
 5. **阶段交付物不完整**：路线要求每阶段独立提交代码、测试、benchmark JSON、
-   结果表和中文说明；代码/测试/表格/说明大体存在，但原始 JSON 主要被
-   `.gitignore` 留在服务器，没有随阶段进入版本库。
+   结果表和中文说明；实际 `8f4f5ae` 同时落入 unified scheduler、PagedAttention
+   和 speculative 三阶段，阶段代码本身没有分别独立提交。代码/测试/表格/说明
+   大体存在，但实验输出主要写在服务器仓库外的 `/nano-vllm/5090-runs/`，而仓库
+   内 `runs/` 又被 `.gitignore` 排除，原始 JSON 因此也没有随阶段版本化。
 6. **额外交付**：RMSNorm、KV-store、课程和面试文档超出 v3 核心路线，但没有
    破坏核心实现；报告中应作为实验/工程表达分开列出。
 
-审查汇总：Standards 有 3 个当前判断项、1 个已修复问题、0 个硬违规；当前均为
-低优先级维护风险。Spec 有 6 个发现，最严重是未验证的 CUDA Graph auto 路由
-与验收缺口。
+审查汇总：Standards 有 3 个当前判断项、0 个硬违规；多轮发现的文档事实错误已
+按证据边界修复，当前判断项均为低优先级维护风险。Spec 有 6 个发现，最严重是
+未验证的 CUDA Graph auto 路由与验收缺口。
 
 ## 14. 现有文档需要纠正的口径
 
@@ -692,9 +695,9 @@ PagedAttention GQA/mixed smoke；split-K micro 每个 case 内置 reference asse
 |---|---|
 | 当前改动 60 files/7751 insertions | 截至 2955070 为 61/9521/351 |
 | CUDA Graph 只支持 Flash，Triton 是未来工作 | Triton graph 已实现，但未通过服务器验收 |
-| split-K 下一步待实现/待跑 E2E | 已实现；micro 快、eager E2E 吞吐下降 8.4% |
+| split-K 下一步待实现/待跑 E2E | 已实现；batch8、context2048/4096 micro 更快，context512 热缓存更慢，eager E2E 吞吐下降 8.4% |
 | PagedAttention 已完成 | general correctness 完成，性能未达 95%；graph 未验 |
-| speculative decoding 已完成 | MVP/单测完成，GPU acceptance/E2E 未完成 |
+| speculative decoding 已完成 | n-gram/verify 与 draft reservation 有单测；draft 模型加载/联合 KV planner 仅 CODE，GPU acceptance/E2E 未完成 |
 | greedy 金标应始终 bit-exact | 动态 batch 下 baseline 自身也可能分叉；需要 margin 诊断 |
 | model_ms 就是 GPU kernel latency | 当前主要是 host timing，不能当独立 GPU event |
 
@@ -709,7 +712,8 @@ PagedAttention GQA/mixed smoke；split-K micro 每个 case 内置 reference asse
 - 实现 BlockManager 的 O(1) free/LRU、collision check 和 speculative truncate；
 - 自研 Triton fine-page PagedAttention 和 split-K，并用 micro/E2E 发现局部加速
   不等于系统加速；
-- 实现 greedy n-gram/draft MVP，但 GPU 性能验收尚未完成。
+- 实现并单测 greedy n-gram/verify 与 draft reservation；draft 模型加载和联合
+  KV planner 只有代码路径，GPU 性能验收尚未完成。
 
 ### 不能说
 
@@ -724,7 +728,7 @@ PagedAttention GQA/mixed smoke；split-K micro 每个 case 内置 reference asse
 ## 16. 当前恢复优先级
 
 ```text
-P0  获取当前服务器问题的完整日志并恢复 GPU 可用性
+P0  获取当前服务器问题的完整日志，确认 GPU/NVML 是否受影响后再按日志恢复
 P0  备份 /nano-vllm/5090-runs，防止租用实例回收原始证据
 P0  对 2955070 先跑 graph-general smoke，再跑 graph-auto
 P1  修复/明确 graph auto 的运行时 context 路由

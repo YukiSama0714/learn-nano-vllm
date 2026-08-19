@@ -321,8 +321,9 @@ class SchedulerOutput:
 ```
 
 关键点：`is_prefill` 和 `needs_sampling` 属于每个请求，而不是整个 batch。
-旧策略通过 `SchedulerOutput.from_phase()` 进入兼容路径，原 CLI 和默认行为
-保持不变。
+旧策略通过 `SchedulerOutput.from_phase()` 进入兼容路径；配置源码仍保留原默认
+值，相关调度单测通过。但没有完整 old-policy trace 或 CLI snapshot，因此只能说
+“提供了兼容路径”，不能把行为完全不变当成已证明结论。
 
 v3 每步的决策顺序是：
 
@@ -659,8 +660,9 @@ page16 和 page32 分别只有 Flash 吞吐的：
 
 page32 相对 page16 只提高 1.0% output tok/s；TTFT、queue 和 E2E 分别改善
 3.9%、3.6% 和 3.2%，但两者的 mixed rate 与 Chunks P95 完全相同。说明
-page-size lookup 有影响，却不是足以关闭性能差距的主杠杆，也证明调度粒度
-解耦后没有隐藏地改变 chunk 行为。
+page-size lookup 有影响，却不是足以关闭性能差距的主杠杆；相同的 mixed rate
+和 Chunks P95 也支持“调度粒度解耦后没有明显改变 chunk 行为”，但不是完整
+scheduler trace 等价证明。
 
 phase 分解显示：
 
@@ -695,8 +697,9 @@ program 少于 1024 时启用。microbenchmark JSON 还记录 `resolved_kernel` 
 
 5090 的热缓存 microbenchmark 显示 batch=8、context=2048/4096 分别加速
 1.52 倍和 2.13 倍。加入 256MiB cache flush 后仍有 1.90 倍和 1.99 倍，说明
-split-K 的 GPU kernel 并行化确实有效，而不只是重复读取同一 KV cache 导致的
-L2 假象。这里的 3TB/s 以上是按每个 Q head 重复读取 KV 计算的“有效带宽”；
+收益不是仅在热缓存条件下出现，降低了“结果完全来自 L2 热数据”的可能性；但
+没有 Nsight 计数器，不能仅凭 cache flush 完成因果证明。这里的 3TB/s 以上是按
+每个 Q head 重复读取 KV 计算的“有效带宽”；
 GQA 的四个 Q head 会在同一次 launch 中通过 cache 复用同一个 KV head，不能把
 它当成物理 HBM 带宽。尽管 kernel micro 获益，eager 端到端 A/B 仍然回退：
 
@@ -988,7 +991,8 @@ FlashAttention、CUDA Graph 和 chunked prefill，我主要补齐了请求级指
 259ms 降到 68ms，吞吐下降 0.16%，但 E2E P95 增加 8%，我把这个权衡完整
 保留下来。之后我进一步把调度接口重构为 per-request token budget，实现
 mixed prefill/decode、细粒度 Triton PagedAttention 和 greedy speculative
-decoding。PagedAttention general 正确性已通过；page32 首轮配对 A/B 达到
+MVP；其中 n-gram/verify 状态机有单测，draft 模型加载和联合 KV planner 仍未
+测试。PagedAttention general 正确性已通过；page32 首轮配对 A/B 达到
 Flash 的 84.1%，后续 general 重跑若跨轮复用旧 Flash 基线约为 83.0%。split-K
 在 batch8、context 2048/4096 的 hot/cold micro 更快，eager E2E 吞吐却下降
 8.4%。Triton CUDA Graph 代码已接入但服务器尚未验收，不能提前宣称收益。
@@ -1171,7 +1175,7 @@ git log --oneline origin/main..HEAD
 
 推荐后续顺序：
 
-1. 获取当前服务器问题的完整日志，先恢复 GPU/NVML 可用性；
+1. 获取当前服务器问题的完整日志，先确认 GPU/NVML 是否受影响，再按日志恢复；
 2. 对 `2955070` 先跑 Triton graph-general smoke，再跑 graph-auto；
 3. 修正 graph-auto 按静态最大 block table 选 split-K 的语义偏差，并增加
    CUDA Graph 集成测试；
