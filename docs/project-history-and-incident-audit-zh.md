@@ -62,14 +62,16 @@ PagedAttention 和 CUDA Graph 等多条并行路线。旧文档有一些状态�
 ### 2.2 当前不能宣称完成的部分
 
 - `slo_aware_v3` 已实现 mixed batch，但没有达到路线中规定的最终性能验收；
-- Triton PagedAttention general kernel 正确，但 page32 eager E2E 两轮只达到
-  Flash eager 吞吐的约 83.0%--84.1%；
+- Triton PagedAttention general kernel 正确；page32 首轮配对 A/B 达到 Flash
+  eager 吞吐的 84.1%，后续 general 重跑若复用旧 Flash 基线约为 83.0%，不是
+  第二次配对 A/B；
 - split-K kernel 的 GPU micro 有收益，但 eager E2E 吞吐下降 8.4%，属于
   `REJECTED`；
 - Triton PagedAttention CUDA Graph 已写入源码，但服务器 smoke 尚未给出成功
   结果，且 code review 发现 auto 路由语义偏差；
-- n-gram 和 0.6B draft speculative 路径存在并有单测，但没有完成 100 条固定
-  greedy、acceptance、TPOT、32GB 显存和 10% 改善验收；
+- n-gram/验证状态机和 draft 调度 reservation 有单测；实际 0.6B 加载与联合 KV
+  planner 只有代码路径，也没有完成 100 条固定 greedy、acceptance、TPOT、
+  32GB 显存和 10% 改善验收；
 - 没有完成 HTTP/OpenAI 服务、多卡优化、FP8 KV、量化、LoRA 或异步流水线。
 
 ### 2.3 最初的 batch scaling 只是一条启动自检
@@ -82,8 +84,9 @@ PagedAttention 和 CUDA Graph 等多条并行路线。旧文档有一些状态�
 | 4 | 229.49 | 1147.46 | 27.40 |
 | 8 | 588.76 | 2943.80 | 27.61 |
 
-它证明模型能运行且 continuous batching 有效，但 workload、arrival 和后来的
-Poisson SLO 实验不同，不能拿这些数字与 v2/v3 表格直接比较。
+它证明模型能运行且同步 batching 随 batch size 扩展，但没有测试 continuous
+batching 的动态准入/退出。其 workload、arrival 和后来的 Poisson SLO 实验
+不同，不能拿这些数字与 v2/v3 表格直接比较。
 
 ## 3. 最终稳定的软件与硬件环境
 
@@ -496,9 +499,10 @@ Eager mixed-length E2E：
 | E2E P95 | 8935.55ms | 16226.45ms | 15699.97ms |
 
 表中首轮 page32 为 Flash eager 吞吐的 84.1%；后续 page32 general 重跑为
-221.81 tok/s，若与同一份 267.24 Flash 记录比较约为 83.0%。两轮均未达到 95%
-目标。offered output load 约 256 tok/s；Triton 低于输入负载，TTFT/queue 的
-巨大值主要反映队列不稳定，不能直接当作单次 attention latency。
+221.81 tok/s，若与同一份 267.24 Flash 记录比较约为 83.0%，但后者不是同步
+Flash 配对。首轮已经未达到 95% 目标，后续 general 记录也没有提供达标证据。
+offered output load 约 256 tok/s；Triton 低于输入负载，TTFT/queue 的巨大值主要
+反映队列不稳定，不能直接当作单次 attention latency。
 
 ### 8.2 split-K（`GPU-CORRECT + MICRO + E2E REJECTED`）
 
@@ -588,7 +592,7 @@ split-K；即使 replay 的真实 context 只有 128/512，也不会像 eager au
 
 ## 11. Speculative decoding：实现了什么，缺什么
 
-### 11.1 已实现（`CODE + UNIT`）
+### 11.1 已实现并有单测（`CODE + UNIT`）
 
 - greedy-only 配置校验，非零 temperature 拒绝 speculative；
 - n-gram 最长后缀匹配，无匹配回退普通 decode；
@@ -596,11 +600,18 @@ split-K；即使 replay 的真实 context 只有 128/512，也不会像 eager au
 - 全接受、首 token 拒绝、部分接受；
 - EOS/max_tokens 截断；
 - KV `reserve/truncate` 与 committed length 回滚；
-- Qwen3-0.6B draft 模型加载；
-- target + draft KV block bytes 联合规划；
-- draft 仅支持 TP=1。
+- draft 调度 reservation。
 
-### 11.2 尚未验收（`UNVERIFIED`）
+### 11.2 已实现但缺少对应单测（`CODE + UNVERIFIED`）
+
+- Qwen3-0.6B draft 模型实例化和权重加载；
+- target + draft KV block bytes 联合规划与双 KV cache 分配。
+- draft 仅支持 TP=1 的配置校验。
+
+现有 spec/scheduler 单测没有实例化 0.6B 模型，也没有直接执行联合 KV planner，
+因此不能把这两项标成 `UNIT`。
+
+### 11.3 尚未完成 GPU/端到端验收（`UNVERIFIED`）
 
 - 固定 100 条请求与非 speculative target token IDs 完全一致；
 - n-gram 普通 workload 的 acceptance/TPOT；
@@ -665,11 +676,14 @@ PagedAttention GQA/mixed smoke；split-K micro 每个 case 内置 reference asse
 3. **阶段 3 仅部分完成**：代码/单测存在，100 条 token equality、acceptance、
    TPOT、32GB 和 10% 目标缺失。
 4. **旧策略兼容证明不完整**：有适配接口和单测，没有完整 trace/CLI snapshot。
-5. **额外交付**：RMSNorm、KV-store、课程和面试文档超出 v3 核心路线，但没有
+5. **阶段交付物不完整**：路线要求每阶段独立提交代码、测试、benchmark JSON、
+   结果表和中文说明；代码/测试/表格/说明大体存在，但原始 JSON 主要被
+   `.gitignore` 留在服务器，没有随阶段进入版本库。
+6. **额外交付**：RMSNorm、KV-store、课程和面试文档超出 v3 核心路线，但没有
    破坏核心实现；报告中应作为实验/工程表达分开列出。
 
 审查汇总：Standards 有 3 个当前判断项、1 个已修复问题、0 个硬违规；当前均为
-低优先级维护风险。Spec 有 5 个发现，最严重是未验证的 CUDA Graph auto 路由
+低优先级维护风险。Spec 有 6 个发现，最严重是未验证的 CUDA Graph auto 路由
 与验收缺口。
 
 ## 14. 现有文档需要纠正的口径

@@ -17,10 +17,12 @@
 3. 一个更快的 GPU kernel，最终能在端到端 TPOT 中贡献多少？
 
 v3 实验分支进一步加入统一 mixed-batch 调度、16/32/64-token Triton
-PagedAttention，以及 greedy 无损的 n-gram / Qwen3 draft 推测解码。实现与
+PagedAttention，以及以 greedy 无损为目标的 n-gram / Qwen3 draft 推测解码
+MVP（固定 100 请求 token 全等尚未验收）。实现与
 5090 验收命令见 [`docs/v3-design-zh.md`](docs/v3-design-zh.md)。截至当前，
-PagedAttention general correctness 已验证，但 page32 eager E2E 两轮只达到
-Flash eager 吞吐的约 83.0%--84.1%；split-K 在 batch8、context 2048/4096
+PagedAttention general correctness 已验证；page32 首轮配对 A/B 达到 Flash
+eager 吞吐的 84.1%，后续 general 重跑若复用旧 Flash 基线则约为 83.0%，并非
+第二次配对 A/B。split-K 在 batch8、context 2048/4096
 的 micro 更快，但 eager E2E 回退，CUDA Graph 路径仍待服务器 smoke。完整
 问题、实现和证据口径见
 [`docs/project-history-and-incident-audit-zh.md`](docs/project-history-and-incident-audit-zh.md)。
@@ -99,7 +101,8 @@ ablation。v2 的核心机制包括：
 - 独立的配置 SLO 与固定验收阈值；
 - KV-store 和 RMSNorm 后端 A/B。
 - mixed-length 输入、逐步阶段耗时、KV 尾块浪费和推测接受率；
-- schema、Git commit、依赖版本、模型摘要和 greedy token 金标。
+- schema、Git commit、依赖版本、模型摘要和输出 token IDs；temperature=0 时可
+  作为 greedy 金标候选。
 
 [`benchmarks/compare_results.py`](benchmarks/compare_results.py) 将多个 JSON
 结果整理成可直接放进报告的 Markdown 表格。
