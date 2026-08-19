@@ -18,8 +18,11 @@
 
 v3 实验分支进一步加入统一 mixed-batch 调度、16/32/64-token Triton
 PagedAttention，以及 greedy 无损的 n-gram / Qwen3 draft 推测解码。实现与
-5090 验收命令见 [`docs/v3-design-zh.md`](docs/v3-design-zh.md)。v3 的 GPU
-性能数据尚未写入下方“核心结果”；在验收 JSON 产生前不提前宣称收益。
+5090 验收命令见 [`docs/v3-design-zh.md`](docs/v3-design-zh.md)。截至当前，
+PagedAttention general correctness 已验证，但 page32 eager E2E 只有 Flash
+eager 吞吐的 84.1%；split-K micro 更快而 eager E2E 回退，CUDA Graph 路径
+仍待服务器 smoke。完整问题、实现和证据口径见
+[`docs/project-history-and-incident-audit-zh.md`](docs/project-history-and-incident-audit-zh.md)。
 
 ## 核心结果
 
@@ -163,6 +166,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 - [`docs/slo-v2-results-zh.md`](docs/slo-v2-results-zh.md)
 - [`docs/interview-guide-zh.md`](docs/interview-guide-zh.md)
 - [`docs/project-baseline-to-v3-zh.md`](docs/project-baseline-to-v3-zh.md)
+- [`docs/project-history-and-incident-audit-zh.md`](docs/project-history-and-incident-audit-zh.md)
 - [`docs/v3-design-zh.md`](docs/v3-design-zh.md)
 - [`docs/course/00-syllabus.md`](docs/course/00-syllabus.md)
 

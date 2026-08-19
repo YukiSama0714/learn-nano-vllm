@@ -14,12 +14,12 @@
 2. KV cache 的分页、prefix reuse、回滚和 attention backend 如何协同；
 3. 一个局部更快的 kernel，是否真的能改善端到端请求指标。
 
-相对 `origin/main`，当前分支改动约为：
+相对 `origin/main`，截至功能审计点 `2955070` 的改动为：
 
 ```text
-60 files changed
-7751 insertions
-349 deletions
+61 files changed
+9521 insertions
+351 deletions
 ```
 
 最成熟的产出是 `slo_aware_v2`：在 Qwen3-8B、RTX 5090 的 held-out
@@ -41,7 +41,8 @@ PagedAttention 端到端吞吐只有 FlashAttention 的 84.1%，仍属于待优�
 | Triton KV-store | 是 | micro + E2E A/B | TPOT 改善约 1.52% |
 | Triton RMSNorm | 是 | micro + E2E A/B | 未优于 compiled，默认关闭 |
 | Triton PagedAttention 16/32/64 | 是 | GPU matrix 通过 | page32 只有 Flash 的 84.1% |
-| split-K PagedAttention decode | 是，实验性 | correctness + hot micro + E2E | E2E 吞吐下降 8.4%，默认关闭 |
+| split-K PagedAttention decode | 是，实验性 | correctness + hot/cold micro + eager E2E | Eager E2E 吞吐下降 8.4%，默认关闭 |
+| Triton PagedAttention CUDA Graph | 是，实验性 | 本地静态检查 | 服务器 smoke 未确认，禁止宣称完成 |
 | n-gram speculative decoding | 是 | 接受/拒绝/回滚测试 | 完整 5090 A/B 待完成 |
 | Qwen3-0.6B draft decoding | 是 | 单元测试与显存规划路径 | TP=1 MVP，性能待验收 |
 
@@ -427,16 +428,15 @@ partial prefill 只需要更新 KV，不需要对每个 prompt token 计算完�
 
 ### 5.4 CUDA Graph 边界
 
-当前 CUDA Graph 只用于：
+提交 `2955070` 后，未设置 `--enforce-eager` 的 pure decode 可以为 Flash 或
+Triton PagedAttention capture CUDA Graph；mixed batch 和 speculative verify
+仍走 eager。此前 Flash/page16/page32/split-K A/B 都显式使用
+`--enforce-eager`，所以 Graph 不解释那些已经记录的 eager 差距。
 
-```text
-FlashAttention + pure decode + no speculative proposals
-```
-
-mixed batch、Triton PagedAttention 和 speculative verify 首版走 eager。
-不过当前 Flash/page16/page32 A/B 都显式使用了 `--enforce-eager`，所以 CUDA
-Graph 不解释这组实验中的差距。它是未来把 Triton backend 接入默认在线路径时
-仍需解决的系统问题，不能与本轮 eager kernel 差距混为一谈。
+但“源码已接入”不等于“服务器已验收”。当前尚未看到 Triton graph smoke 的
+成功输出，也没有 graph 集成测试；而且 capture 的静态最大 block-table 宽度会
+让 `auto` 在短 context graph replay 中也可能固定选择 split-K。详细事实审计见
+[`project-history-and-incident-audit-zh.md`](project-history-and-incident-audit-zh.md)。
 
 ## 6. 第四层改造：BlockPool、prefix cache 与回滚
 
@@ -708,9 +708,10 @@ queue、TTFT 和 E2E。
 
 因此 `general` 恢复为 PagedAttention decode 的安全默认值，split-K 保留为
 opt-in 失败实验。microbenchmark 默认在每次计时前冲刷 256MiB cache buffer；
-下一步先把 `triton_paged` pure decode 接入 CUDA Graph，捕获 36 层的
-partial/reduce launch，再做 graph-general/graph-auto A/B。只有 graph E2E 也
-获益时才允许重新推荐 split-K；若仍回退，再进入 GQA group KV 共享 traversal。
+`2955070` 已把 `triton_paged` pure decode 接入 CUDA Graph，但服务器 smoke
+尚未确认，且 graph-auto 存在按静态最大 block table 固定选择 split-K 的语义
+风险。下一步应先验证/修正 graph-general 与 graph-auto；只有 graph E2E 获益
+时才允许重新推荐 split-K，若仍回退再进入 GQA group KV 共享 traversal。
 
 ## 8. 第六层改造：Greedy 无损推测解码
 
@@ -976,8 +977,9 @@ FlashAttention、CUDA Graph 和 chunked prefill，我主要补齐了请求级指
 259ms 降到 68ms，吞吐下降 0.16%，但 E2E P95 增加 8%，我把这个权衡完整
 保留下来。之后我进一步把调度接口重构为 per-request token budget，实现
 mixed prefill/decode、细粒度 Triton PagedAttention 和 greedy speculative
-decoding。PagedAttention 正确性已通过，但当前最佳 page32 端到端只有 Flash
-的 84.1%，目前在沿 split-K occupancy 和 GQA KV 复用继续优化 decode。
+decoding。PagedAttention general 正确性已通过，但 page32 eager 端到端只有
+Flash 的 84.1%；split-K 虽在 hot/cold micro 都更快，eager E2E 吞吐却下降
+8.4%。Triton CUDA Graph 代码已接入但服务器尚未验收，不能提前宣称收益。
 
 ### 13.2 推荐的 15 分钟展开顺序
 
@@ -1005,8 +1007,9 @@ decoding。PagedAttention 正确性已通过，但当前最佳 page32 端到端�
 
 - 实现支持 GQA、16/32/64-token page 和 FP32 online softmax 的 Triton
   PagedAttention，构建 batch/context/page GPU correctness matrix；识别当前
-  最佳 page32 在在线负载中仅达到 Flash 84.1% 吞吐，并通过 step breakdown
-  将瓶颈收敛到小 batch 长 context occupancy 与 GQA KV reuse。
+  page32 eager 在在线负载中仅达到 Flash 84.1% 吞吐，split-K 虽在 cold micro
+  获得约 2 倍收益却使 eager E2E 吞吐下降 8.4%，由此定位设备并行度与逐层
+  launch/Graph 之间的系统权衡。
 
 - 构建支持 bulk/constant/Poisson arrivals 的版本化 benchmark，采集 TTFT、
   TPOT、Max ITL、KV fragmentation、prefix hit 与阶段耗时，并以固定验收阈值、
@@ -1155,12 +1158,13 @@ git log --oneline origin/main..HEAD
 
 推荐后续顺序：
 
-1. 在 5090 上完成 split-K correctness 和 page32 general/split-K micro A/B；
-2. 运行 split-K page32 端到端 A/B；若仍不达标再融合 GQA KV traversal；
-3. 用 bulk A/B 验证峰值服务能力，再为 Triton decode 接入 CUDA Graph；
-4. 完成 n-gram 与 0.6B draft 的 acceptance/TPOT/显存验收；
-5. 加入 CPU/GPU async overlap；
-6. 再考虑 FP8 KV、fused sampler、HTTP 服务与 Prometheus；
+1. 获取当前服务器问题的完整日志，先恢复 GPU/NVML 可用性；
+2. 对 `2955070` 先跑 Triton graph-general smoke，再跑 graph-auto；
+3. 修正 graph-auto 按静态最大 block table 选 split-K 的语义偏差，并增加
+   CUDA Graph 集成测试；
+4. 只有 graph E2E 获益时才重新推荐 split-K，否则再做 GQA KV traversal；
+5. 完成 n-gram 与 0.6B draft 的 acceptance/TPOT/显存验收；
+6. 加入 CPU/GPU async overlap，再考虑 FP8 KV、fused sampler 和在线服务；
 7. 最后扩展到多卡 TP 通信与 overlap。
 
 项目最值得保留的思维方式是：
