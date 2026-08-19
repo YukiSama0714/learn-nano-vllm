@@ -918,7 +918,7 @@ logits 近乎相等时，极小数值差异可能翻转 argmax，并在自回归
 
 ### 11.3 JSON provenance
 
-schema v3 记录：
+`benchmark_slo.py` 生成的 schema v3 记录：
 
 - Git commit；
 - PyTorch/CUDA/Triton/FlashAttention 版本；
