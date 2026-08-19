@@ -26,7 +26,8 @@
 320 请求实验中，将 Max ITL P95 从 259.21ms 降到 68.23ms，吞吐仅下降
 0.16%。v3 的 mixed batch、细粒度 Triton PagedAttention 和 greedy
 speculative decoding 已完成主要实现与正确性测试，但当前最佳的 page32
-PagedAttention 端到端吞吐只有 FlashAttention 的 84.1%，仍属于待优化能力。
+PagedAttention 两轮端到端吞吐只达到 FlashAttention 的约 83.0%--84.1%，仍
+属于待优化能力。
 
 ### 0.1 当前能力状态
 
@@ -40,7 +41,7 @@ PagedAttention 端到端吞吐只有 FlashAttention 的 84.1%，仍属于待优�
 | O(1) BlockPool、LRU、truncate | 是 | 单元测试 | 细 page E2E 仍在验收 |
 | Triton KV-store | 是 | micro + E2E A/B | TPOT 改善约 1.52% |
 | Triton RMSNorm | 是 | micro + E2E A/B | 未优于 compiled，默认关闭 |
-| Triton PagedAttention 16/32/64 | 是 | GPU matrix 通过 | page32 只有 Flash 的 84.1% |
+| Triton PagedAttention 16/32/64 | 是 | GPU matrix 通过 | page32 两轮约为 Flash 的 83.0%--84.1% |
 | split-K PagedAttention decode | 是，实验性 | correctness + hot/cold micro + eager E2E | Eager E2E 吞吐下降 8.4%，默认关闭 |
 | Triton PagedAttention CUDA Graph | 是，实验性 | 本地静态检查 | 服务器 smoke 未确认，禁止宣称完成 |
 | n-gram speculative decoding | 是 | 接受/拒绝/回滚测试 | 完整 5090 A/B 待完成 |
@@ -650,6 +651,10 @@ page16 和 page32 分别只有 Flash 吞吐的：
 224.66 / 267.24 = 84.1%
 ```
 
+这是首轮 A/B 的 84.1%；随后为 split-K 运行的 page32 general 重跑为
+221.81 tok/s，若与同一份 267.24 Flash 记录比较约为 83.0%。两轮都未达到
+95% 门槛，结论不变。
+
 page32 相对 page16 只提高 1.0% output tok/s；TTFT、queue 和 E2E 分别改善
 3.9%、3.6% 和 3.2%，但两者的 mixed rate 与 Chunks P95 完全相同。说明
 page-size lookup 有影响，却不是足以关闭性能差距的主杠杆，也证明调度粒度
@@ -701,10 +706,11 @@ GQA 的四个 Q head 会在同一次 launch 中通过 cache 复用同一个 KV h
 两边 mixed-step rate 都约为 12%，Chunks P95 都是 5，说明回退不是调度差异。
 split-K 运行中 pure-decode 平均为 28.053ms；其中 batch=8 占 pure-decode
 step 的 89.0%，平均为 28.071ms。该 A/B 使用 `--enforce-eager`，split-K 将
-每层一次 attention launch 变成 partial/reduce 两次，36 层的 Python/Triton
-启动开销会逐 token 累积；micro 的 CUDA event 只测设备执行，不包含这部分 host
-launch 成本。吞吐低于约 256 output tok/s 的 offered load 后，又进一步放大
-queue、TTFT 和 E2E。
+每层一次 attention launch 变成 partial/reduce 两次，并增加 partial workspace
+流量；这两项是逐 token 累积的候选原因。现有 `model_ms` 来自 host
+`perf_counter`，没有 GPU event 或 Nsight 证据，不能把回退确定归因于 host
+launch。micro 与 E2E 的差异仍需用 CUDA Graph A/B 或 profiler 分解。吞吐低于
+约 256 output tok/s 的 offered load 后，又进一步放大 queue、TTFT 和 E2E。
 
 因此 `general` 恢复为 PagedAttention decode 的安全默认值，split-K 保留为
 opt-in 失败实验。microbenchmark 默认在每次计时前冲刷 256MiB cache buffer；
@@ -977,9 +983,10 @@ FlashAttention、CUDA Graph 和 chunked prefill，我主要补齐了请求级指
 259ms 降到 68ms，吞吐下降 0.16%，但 E2E P95 增加 8%，我把这个权衡完整
 保留下来。之后我进一步把调度接口重构为 per-request token budget，实现
 mixed prefill/decode、细粒度 Triton PagedAttention 和 greedy speculative
-decoding。PagedAttention general 正确性已通过，但 page32 eager 端到端只有
-Flash 的 84.1%；split-K 虽在 hot/cold micro 都更快，eager E2E 吞吐却下降
-8.4%。Triton CUDA Graph 代码已接入但服务器尚未验收，不能提前宣称收益。
+decoding。PagedAttention general 正确性已通过，但 page32 eager 两轮端到端
+只达到 Flash 的约 83.0%--84.1%；split-K 在 batch8、context 2048/4096 的
+hot/cold micro 更快，eager E2E 吞吐却下降 8.4%。Triton CUDA Graph 代码已
+接入但服务器尚未验收，不能提前宣称收益。
 
 ### 13.2 推荐的 15 分钟展开顺序
 
@@ -1007,9 +1014,9 @@ Flash 的 84.1%；split-K 虽在 hot/cold micro 都更快，eager E2E 吞吐却�
 
 - 实现支持 GQA、16/32/64-token page 和 FP32 online softmax 的 Triton
   PagedAttention，构建 batch/context/page GPU correctness matrix；识别当前
-  page32 eager 在在线负载中仅达到 Flash 84.1% 吞吐，split-K 虽在 cold micro
-  获得约 2 倍收益却使 eager E2E 吞吐下降 8.4%，由此定位设备并行度与逐层
-  launch/Graph 之间的系统权衡。
+  page32 eager 在在线负载中两轮仅达到 Flash 约 83.0%--84.1% 吞吐，split-K
+  虽在 cold micro 获得约 2 倍收益却使 eager E2E 吞吐下降 8.4%，由此定位设备
+  并行度与逐层 launch/Graph 之间的系统权衡。
 
 - 构建支持 bulk/constant/Poisson arrivals 的版本化 benchmark，采集 TTFT、
   TPOT、Max ITL、KV fragmentation、prefix hit 与阶段耗时，并以固定验收阈值、

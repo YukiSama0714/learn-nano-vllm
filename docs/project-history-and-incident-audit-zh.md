@@ -62,8 +62,8 @@ PagedAttention 和 CUDA Graph 等多条并行路线。旧文档有一些状态�
 ### 2.2 当前不能宣称完成的部分
 
 - `slo_aware_v3` 已实现 mixed batch，但没有达到路线中规定的最终性能验收；
-- Triton PagedAttention general kernel 正确，但 page32 eager E2E 只有 Flash
-  eager 吞吐的 84.1%；
+- Triton PagedAttention general kernel 正确，但 page32 eager E2E 两轮只达到
+  Flash eager 吞吐的约 83.0%--84.1%；
 - split-K kernel 的 GPU micro 有收益，但 eager E2E 吞吐下降 8.4%，属于
   `REJECTED`；
 - Triton PagedAttention CUDA Graph 已写入源码，但服务器 smoke 尚未给出成功
@@ -117,6 +117,13 @@ Mac 路径不能在服务器容器中使用。对话末期发生的
 `cd /Users/yuki/...: No such file or directory` 就属于主机路径混用，不是 Git
 仓库损坏。
 
+### 3.1 四天租期带来的项目约束
+
+用户一开始明确说明 RTX 5090 只租 4 天。这使“保存不可重建的 GPU 证据”比继续
+堆功能更优先：先固定环境、模型摘要、v2 baseline、greedy 对照和原始 JSON/log，
+再做 mixed batch、PagedAttention 与 speculative A/B。对话中已保存大量汇总
+表，但原始实验目录仍主要位于租用服务器，因此第 4.12 节的备份风险并未消失。
+
 ## 4. 环境、网络与服务器问题全记录
 
 ### 4.1 GitHub clone/fetch/pull 超时
@@ -164,10 +171,17 @@ origin/codex/slo-aware-scheduler is not a branch
 **现象**：下载 Qwen3-0.6B 到 70%--80% 时，访问
 `cas-server.xethub.hf.co` 返回 `401 Unauthorized`。
 
-**分类**：Hugging Face Xet/CAS 下载链路问题，不是模型权限或推理代码问题。
+**分类**：失败发生在 Hugging Face Xet/CAS 文件重建链路；现有日志没有显示为
+gated-repo 权限拒绝，也与推理代码无关。由于没有服务端诊断，不能进一步断言
+401 的根因。
 
 **处理事实**：对话中降低到 `--max-workers 2` 后继续下载，0.6B 和 8B 最终都
 完成；用户明确要求以后 Hugging Face 资源优先使用镜像。
+
+8B 下载期间还曾为了让 PyTorch wheel 获得带宽而暂停。Hugging Face snapshot
+下载在目标目录、缓存和未完成文件仍保留时可以继续复用已有内容；对话最终只
+确认“已经都下完了”，没有逐文件日志证明实际复用了多少。因此准确结论是暂停
+不等于必然从头下载，而不是断言本次每个分片都完成了断点续传。
 
 **固定偏好**：
 
@@ -205,6 +219,10 @@ Toolkit 编译器。运行 PyTorch、Triton 和预编译 FlashAttention wheel �
 **现象**：GitHub 244MiB wheel 下载只有约 20KiB/s；断点续传停在 12MiB，
 随后连接超时；从 Mac `scp -P 32222` 又因密码/连接问题失败。
 
+在此之前，直接执行 `uv pip install --no-deps <GitHub wheel URL>` 还长时间停在
+`Resolving dependencies...`。该界面没有给出依赖冲突证据，更可能仍在等待远端
+wheel/metadata；对话没有足够日志确认内部停点。
+
 **处理**：服务器端使用 `curl -L -C - --retry ...` 继续下载，最终依赖安装完成。
 
 `ps` 中 curl 的 `STAT=S` 只表示进程在等待网络/事件；真正判断是否推进要同时看
@@ -231,8 +249,10 @@ NVML/CUDA 初始化失败。
 
 **处理**：重启租用实例后恢复；PagedAttention CUDA 测试随即可以运行。
 
-**结论**：这是实例/容器 GPU 映射或驱动状态故障，不应通过重装 PyTorch反复
-“修复”。今后遇到同样组合，优先保存日志并重启实例。
+**结论**：现象更符合实例/容器设备映射或驱动状态的瞬时故障，而不是 PyTorch
+wheel 安装错误；但对话中没有宿主机日志，不能把它写成已确认根因。今后遇到
+同样组合，应先保存日志和联系平台，再按平台允许的方式重启实例，而不是反复
+重装 PyTorch。
 
 ### 4.8 CUDA 测试被 skipped
 
@@ -317,8 +337,10 @@ Parallel 和 temperature sampling。
 preemption、prefix hit、KV 分配/有效/尾块浪费、step phase、GPU 显存、
 proposed/accepted token、arrival pattern、固定 seed 和环境 provenance。
 
-benchmark JSON 当前为 schema v3，记录 Git commit、Torch/CUDA/Triton/
-FlashAttention、模型摘要和逐请求 token IDs。
+`benchmark_slo.py` 的 JSON 当前为 schema v3，记录 Git commit、
+Torch/CUDA/Triton/FlashAttention、模型摘要和逐请求 token IDs。kernel benchmark
+使用独立 schema：对话中的 PagedAttention hot 结果为 v1，加入 cold-cache 与
+decode-kernel 字段后的结果为 v2，不能笼统称为 v3。
 
 ### 5.3 `slo_aware` v1（`REJECTED`）
 
@@ -473,9 +495,10 @@ Eager mixed-length E2E：
 | TPOT P95 | 27.92ms | 38.19ms | 37.89ms |
 | E2E P95 | 8935.55ms | 16226.45ms | 15699.97ms |
 
-page32 只有 Flash eager 吞吐的 84.1%，未达到 95% 目标。两者 offered output
-load 约 256 tok/s；Triton 低于输入负载，TTFT/queue 的巨大值主要反映队列不
-稳定，不能直接当作单次 attention latency。
+表中首轮 page32 为 Flash eager 吞吐的 84.1%；后续 page32 general 重跑为
+221.81 tok/s，若与同一份 267.24 Flash 记录比较约为 83.0%。两轮均未达到 95%
+目标。offered output load 约 256 tok/s；Triton 低于输入负载，TTFT/queue 的
+巨大值主要反映队列不稳定，不能直接当作单次 attention latency。
 
 ### 8.2 split-K（`GPU-CORRECT + MICRO + E2E REJECTED`）
 
@@ -620,13 +643,18 @@ PagedAttention GQA/mixed smoke；split-K micro 每个 case 内置 reference asse
 
 判断项：
 
-1. **文档状态过期（高）**：旧复习手册仍把 Triton CUDA Graph 写成未来工作，
-   但 `2955070` 已有实现；diff 统计也已过期。
+1. **已修复的文档状态问题（原为高）**：审查时发现旧复习手册仍把 Triton
+   CUDA Graph 写成未来工作，diff 统计也停留在旧提交；本轮已在
+   `project-baseline-to-v3-zh.md` 和 README 中按 `2955070` 纠正，不再属于当前
+   未解决问题。
 2. **Repeated Switch / Primitive Obsession（低）**：`general/split_k/auto` 字符串
    在 Config、Attention 和两个 benchmark 重复声明，未来容易漂移。
 3. **Divergent Change（低）**：`model_runner.py` 同时承担分布式生命周期、batch
    preparation、draft、metrics 和 CUDA Graph；下一次 graph 扩展前应考虑抽出
    graph state 模块。
+4. **Duplicated Documentation / Shotgun Surgery（低）**：PagedAttention 的状态和
+   关键数字同时出现在 README、复习手册和本文；以后更新一次实验可能需要同步
+   三处。应以本文为事实账本，其他文档只保留摘要和链接。
 
 ### 13.2 Spec
 
@@ -640,8 +668,9 @@ PagedAttention GQA/mixed smoke；split-K micro 每个 case 内置 reference asse
 5. **额外交付**：RMSNorm、KV-store、课程和面试文档超出 v3 核心路线，但没有
    破坏核心实现；报告中应作为实验/工程表达分开列出。
 
-审查汇总：Standards 3 个判断项、0 个硬违规，最严重是文档状态过期；Spec
-5 个发现，最严重是未验证的 CUDA Graph auto 路由与验收缺口。
+审查汇总：Standards 有 3 个当前判断项、1 个已修复问题、0 个硬违规；当前均为
+低优先级维护风险。Spec 有 5 个发现，最严重是未验证的 CUDA Graph auto 路由
+与验收缺口。
 
 ## 14. 现有文档需要纠正的口径
 

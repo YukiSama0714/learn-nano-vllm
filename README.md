@@ -19,9 +19,10 @@
 v3 实验分支进一步加入统一 mixed-batch 调度、16/32/64-token Triton
 PagedAttention，以及 greedy 无损的 n-gram / Qwen3 draft 推测解码。实现与
 5090 验收命令见 [`docs/v3-design-zh.md`](docs/v3-design-zh.md)。截至当前，
-PagedAttention general correctness 已验证，但 page32 eager E2E 只有 Flash
-eager 吞吐的 84.1%；split-K micro 更快而 eager E2E 回退，CUDA Graph 路径
-仍待服务器 smoke。完整问题、实现和证据口径见
+PagedAttention general correctness 已验证，但 page32 eager E2E 两轮只达到
+Flash eager 吞吐的约 83.0%--84.1%；split-K 在 batch8、context 2048/4096
+的 micro 更快，但 eager E2E 回退，CUDA Graph 路径仍待服务器 smoke。完整
+问题、实现和证据口径见
 [`docs/project-history-and-incident-audit-zh.md`](docs/project-history-and-incident-audit-zh.md)。
 
 ## 核心结果
